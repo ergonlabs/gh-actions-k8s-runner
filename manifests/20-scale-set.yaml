@@ -83,7 +83,7 @@ spec:
             # ghcr.io/actions/actions-runner lacks libatomic1, which Node 26 needs.
             # Both this and the runner container MUST use the same image: the init
             # container copies /home/runner/externals out of it.
-            image: localhost:5001/ergonlabs/actions-runner:2026-08-13e
+            image: localhost:5001/ergonlabs/actions-runner:2026-08-14
             command: ["cp"]
             args: ["-r", "-v", "/home/runner/externals/.", "/home/runner/tmpDir/"]
             env:
@@ -188,7 +188,7 @@ spec:
             # ghcr.io/actions/actions-runner lacks libatomic1, which Node 26 needs.
             # Both this and the runner container MUST use the same image: the init
             # container copies /home/runner/externals out of it.
-            image: localhost:5001/ergonlabs/actions-runner:2026-08-13e
+            image: localhost:5001/ergonlabs/actions-runner:2026-08-14
             command: ["/home/runner/run.sh"]
             env:
               - name: POD_NAME

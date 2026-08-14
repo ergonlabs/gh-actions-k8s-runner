@@ -59,6 +59,10 @@ ARG KUSTOMIZE_VERSION=5.8.1
 ARG KIND_VERSION=0.32.0
 ARG YQ_VERSION=4.53.3
 ARG GO_VERSION=1.26.5
+# Not pinned upstream: kind-cluster-bootstrap installs via
+# `curl .../tilt/scripts/install.sh | bash`, which always grabs latest. Track
+# that here so the baked binary doesn't drift stale against new E2E runs.
+ARG TILT_VERSION=0.37.6
 
 RUN set -eux; \
     cd /tmp; \
@@ -84,9 +88,17 @@ RUN set -eux; \
     curl -fsSL -o yq "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64"; \
     install -m 0755 yq /usr/local/bin/yq; \
     \
-    rm -rf /tmp/helm.tgz /tmp/helm /tmp/kubectl /tmp/kustomize.tgz /tmp/kustomize /tmp/kind /tmp/yq; \
+    # tilt — e2e-cluster-bootstrap's `tilt ci` step needs it; baking it in skips
+    # kind-cluster-bootstrap's curl-install download every E2E job. checksum from
+    # the release's own checksums.txt.
+    curl -fsSL -o tilt.tar.gz "https://github.com/tilt-dev/tilt/releases/download/v${TILT_VERSION}/tilt.${TILT_VERSION}.linux.x86_64.tar.gz"; \
+    echo "e9672b8a18d43501f35dcfe98465969a7db0e436b36cf0c50c7e6f8d40de5fe6  tilt.tar.gz" | sha256sum -c -; \
+    tar xzf tilt.tar.gz tilt; \
+    install -m 0755 tilt /usr/local/bin/tilt; \
+    \
+    rm -rf /tmp/helm.tgz /tmp/helm /tmp/kubectl /tmp/kustomize.tgz /tmp/kustomize /tmp/kind /tmp/yq /tmp/tilt.tar.gz /tmp/tilt; \
     helm version --short; kubectl version --client=true 2>/dev/null | head -1; \
-    kustomize version; kind version; yq --version
+    kustomize version; kind version; yq --version; tilt version
 
 # ---------------------------------------------------------------------------
 # Go.
@@ -129,6 +141,46 @@ RUN set -eux; \
 # That broke apps/git-service's golangci-lint on 2026-08-13 — introduced by an
 # earlier version of this very file. GitHub's hosted images do not set GOROOT
 # globally either; setup-go manages it per job.
+
+# ---------------------------------------------------------------------------
+# Playwright Chromium + OS deps, preloaded.
+#
+# e2e-cluster-bootstrap runs `playwright install --with-deps chromium` on
+# every E2E job — that downloads the Chromium build AND apt-get installs its
+# OS-level deps from scratch every time. Playwright's own install command is
+# cache-aware: it checks $PLAYWRIGHT_BROWSERS_PATH (default
+# $HOME/.cache/ms-playwright) for the exact browser revision tied to the
+# installed npm package version, and skips both the download and the apt-get
+# pass for anything already present at the matching revision. So pre-baking
+# it here needs NO workflow change — the runtime step becomes a fast no-op.
+#
+# Version MUST match test/e2e/package.json in ergonlabs/sugarmaple-app
+# (pinned via pnpm-lock.yaml to playwright@1.60.0 as of 2026-08-14) — browser
+# revisions are tied to the exact playwright version, not just its major.
+# If sugarmaple-app bumps this dependency, this cache silently misses and the
+# runtime step falls back to downloading fresh (slower, not broken) until
+# this ARG is bumped to match.
+#
+# Node here is build-time-only, to run the playwright CLI once, and is
+# unrelated to the per-job Node that actions/setup-node installs from
+# .nvmrc (see the libatomic1 note above for why that one has to be
+# per-job). A standalone tarball (not apt's `nodejs` package) so there's no
+# large `node-*` library dependency tree to purge afterward — an earlier
+# apt-based version of this step took ~15 minutes just to uninstall.
+ARG PLAYWRIGHT_VERSION=1.60.0
+ARG NODE_VERSION=24.19.0
+ENV PLAYWRIGHT_BROWSERS_PATH=/home/runner/.cache/ms-playwright
+RUN set -eux; \
+    cd /tmp; \
+    curl -fsSL -o node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz"; \
+    echo "14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647  node.tar.xz" | sha256sum -c -; \
+    mkdir -p /tmp/node && tar xJf node.tar.xz -C /tmp/node --strip-components=1; \
+    export PATH="/tmp/node/bin:$PATH"; \
+    npm install -g --prefix /tmp/node playwright@${PLAYWRIGHT_VERSION}; \
+    playwright install --with-deps chromium; \
+    rm -rf /tmp/node.tar.xz /tmp/node; \
+    apt-get clean && rm -rf /var/lib/apt/lists/*; \
+    chown -R runner:runner /home/runner/.cache/ms-playwright
 
 # ---------------------------------------------------------------------------
 # Redirect actions/cache to the in-cluster cache server.
