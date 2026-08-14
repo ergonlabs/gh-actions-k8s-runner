@@ -60,7 +60,12 @@ metadata:
   name: arc-store-gc
   namespace: arc-runners
 spec:
-  schedule: "*/15 * * * *"
+  # Was */15. Under heavy PR load on 2026-08-14 the LUN filled to ENOSPC twice in
+  # ~90 minutes because the 15-min cadence couldn't keep pace with churn — each
+  # manual out-of-cycle pass recovered 150-200 GB, confirming it was a cadence
+  # problem, not a broken sweep. concurrencyPolicy: Forbid still prevents overlap,
+  # so a slow sweep just skips the next tick rather than stacking runs.
+  schedule: "*/5 * * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3
