@@ -148,6 +148,7 @@ If the device fills, the GC is not running. Do not delete store dirs of **live**
 | Node job dies `libatomic.so.1` | stock runner image in use instead of the custom one (#3) |
 | `go: not found` | Go missing from the image (#4) |
 | CPU requests suddenly ~doubled | a pod-spec change is rolling the runner set; it settles (#12) |
+| `429 Too Many Requests` / TLS timeouts pulling from Docker Hub | hub mirror down (`kubectl get pods -n arc-runners -l app=arc-hub-mirror`), or dind missing `--registry-mirror` — dockerd silently falls back to direct Hub pulls, which is exactly the rate-limited path |
 
 ## Host disk
 
