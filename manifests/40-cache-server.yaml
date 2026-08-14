@@ -1,0 +1,80 @@
+# Self-hosted GitHub Actions cache server.
+#
+# WHY
+#   actions/cache normally round-trips to GitHub's hosted cache over the internet.
+#   With 12 concurrent runners on a ~100-job matrix that's a thundering herd —
+#   many jobs each uploading an identical cache (~21s to pack+upload, observed
+#   2026-08-13 on sugarmaple-app). This keeps cache traffic on the LAN and the
+#   data on the iSCSI LUN.
+#
+# HOW IT AUTHENTICATES
+#   No shared secret. The server verifies each runner's ACTIONS_RUNTIME_TOKEN JWT
+#   against GitHub's OIDC JWKS (token.actions.githubusercontent.com), so a runner
+#   can only touch its own repo's cache scope. Do NOT set SKIP_TOKEN_VALIDATION —
+#   upstream is explicit that it disables signature verification entirely and is a
+#   dev-only escape hatch.
+#
+# API VERSION
+#   This serves the twirp github.actions.results.api.v1.CacheService routes, i.e.
+#   GitHub's cache API **v2**, which requires actions/cache@v4.2 or newer.
+#   Older actions/cache versions use the v1 API and will keep talking to GitHub.
+#
+# STORAGE
+#   filesystem driver + sqlite, both on the iSCSI LUN via hostPath. The chart's
+#   own PVC is disabled because local-path would put it on the slow local disk.
+#   sqlite needs real file locking, so it must be on the LUN (ext4), never NFS.
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: arc-cache-server
+  namespace: kube-system
+spec:
+  chart: oci://ghcr.io/falcondev-oss/charts/github-actions-cache-server
+  version: "1.1.3"
+  targetNamespace: arc-runners
+  createNamespace: false
+  valuesContent: |-
+    # Predictable service name: arc-cache.arc-runners.svc.cluster.local:3000
+    fullnameOverride: arc-cache
+
+    replicaCount: 1
+
+    config:
+      apiBaseUrl: http://arc-cache.arc-runners.svc.cluster.local:3000
+      # Runners reach the server directly over the cluster network, so proxying
+      # through the server is fine and avoids signed-URL/hostname complications.
+      enableDirectDownloads: false
+      cacheCleanupOlderThanDays: 30
+      cacheFilesystemMaxUsagePercent: 85
+      storage:
+        driver: filesystem
+        filesystem:
+          path: /data/cache
+      db:
+        driver: sqlite
+        sqlite:
+          path: /data/cache-server.db
+
+    # Chart PVC disabled — local-path would land on the 931 GB spinning disk.
+    persistentVolumeClaim:
+      enabled: false
+
+    extraVolumes:
+      - name: data
+        hostPath:
+          path: /mnt/arc-block/cache
+          type: Directory
+    extraVolumeMounts:
+      - name: data
+        mountPath: /data
+
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        memory: 4Gi
+
+    service:
+      type: ClusterIP
+      port: 3000

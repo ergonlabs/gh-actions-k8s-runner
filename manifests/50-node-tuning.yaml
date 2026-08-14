@@ -1,0 +1,83 @@
+# Node sysctl tuning for kind-in-CI.
+#
+# WHY
+#   sugarmaple-app's "E2E Tests" job creates a kind cluster inside the runner
+#   pod's dind sidecar and deploys the full app stack with Tilt. On 2026-08-13 it
+#   failed with the classic kind-in-CI error:
+#
+#     failed to create fsnotify watcher: too many open files.
+#     Consider adjusting inotify limits:
+#     https://kind.sigs.k8s.io/docs/user/known-issues/#pod-errors-due-to-too-many-open-files
+#
+#   The doppler-operator couldn't create fsnotify watchers, so it never became
+#   functional, DopplerSecrets never reached SecretSyncReady, and Tilt's
+#   `kubectl wait dopplersecret --all --timeout=300s` failed. kind itself came up
+#   fine — this is purely a host limit.
+#
+#   Measured on this node:
+#     fs.inotify.max_user_watches   = 1048576  (fine, above kind's 524288)
+#     fs.inotify.max_user_instances = 128      <-- the problem (Ubuntu default)
+#
+#   max_user_instances is a PER-UID limit, and everything kind runs inside dind
+#   is uid 0 on the host, so all 12 concurrent runners share one budget of 128.
+#   A single kind cluster running the full app stack exhausts that by itself.
+#   8192 is generous but these are tiny kernel objects; the cost is negligible.
+#
+# WHY A DAEMONSET
+#   fs.inotify.* sysctls are NOT namespaced, so a pod cannot set them for itself
+#   via securityContext.sysctls — kubelet rejects non-namespaced sysctls. They
+#   must be set on the host. A DaemonSet with a privileged init container is the
+#   standard pattern (same shape as elasticsearch's vm.max_map_count tuner) and,
+#   unlike a one-off `sysctl -w`, it re-applies automatically after a reboot.
+#
+#   A plain /etc/sysctl.d/ drop-in would be tidier, but writing there needs root
+#   and sudo is password-gated on this box. `99-kind-inotify.sysctl` in this
+#   directory holds that version if you'd rather install it by hand — if you do,
+#   this DaemonSet becomes redundant and can be deleted.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: arc-node-tuning
+  namespace: arc-systems
+  labels:
+    app.kubernetes.io/name: arc-node-tuning
+    app.kubernetes.io/part-of: actions-runner-controller
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: arc-node-tuning
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: arc-node-tuning
+    spec:
+      # Single-node box, but tolerate control-plane taints so this still lands
+      # if the node is ever tainted.
+      tolerations:
+        - operator: Exists
+      initContainers:
+        - name: set-sysctls
+          image: alpine:3.20
+          securityContext:
+            privileged: true
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eux
+              sysctl -w fs.inotify.max_user_instances=8192
+              sysctl -w fs.inotify.max_user_watches=1048576
+              # kind also benefits from a deeper event queue under load
+              sysctl -w fs.inotify.max_queued_events=65536
+              sysctl -n fs.inotify.max_user_instances
+      containers:
+        # Nothing to do once the sysctls are set; just stay Running so the
+        # DaemonSet is visibly healthy and re-runs its init on reboot.
+        - name: pause
+          image: alpine:3.20
+          command: ["sh", "-c", "trap 'exit 0' TERM; sleep infinity & wait"]
+          resources:
+            requests:
+              cpu: 1m
+              memory: 8Mi
+            limits:
+              memory: 32Mi

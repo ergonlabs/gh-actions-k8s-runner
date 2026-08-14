@@ -1,0 +1,297 @@
+# Runner scale set "ergonlabs-k8s" — workflows use `runs-on: ergonlabs-k8s`.
+#
+# NOTE: containerMode is deliberately NOT set to "dind".
+#
+# The chart's built-in dind mode hardcodes the sidecar (image, args, volumeMounts)
+# and explicitly filters out any user-supplied container named "dind"
+# (see gha-runner-scale-set.non-runner-non-dind-containers in _helpers.tpl).
+# That makes it impossible to relocate /var/lib/docker, which we must do.
+# With containerMode left at default, the chart passes initContainers, containers
+# and volumes through verbatim, so we hand-roll the dind sidecar below — a faithful
+# copy of the chart's, plus the storage overrides.
+#
+# STORAGE (see README.md for the why):
+#   /var/lib/docker, /var/lib/buildkit -> iSCSI LUN at /mnt/arc-block   (block device)
+#   /home/runner/_work                 -> iSCSI LUN at /mnt/arc-block/work
+#   sockets only                       -> emptyDir (no meaningful data)
+#
+# Nothing here is on NFS any more. overlayfs REFUSES an NFS upperdir
+# ("invalid argument"), verified on this kernel, so engine state must be on a
+# block device. _work moved off NFS on 2026-08-13 too: restoring a 207 MB /
+# 35,883-file pnpm cache took 82 s on NFS vs 5 s on the LUN.
+#
+# hostPath type: Directory is load-bearing. The setup script creates the
+# docker/buildkit/externals subdirs *inside* the mounted LUN only, so if the LUN
+# is not mounted those paths don't exist and pods fail loudly instead of silently
+# filling the 931 GB spinning local disk.
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: arc-ergonlabs-k8s
+  namespace: kube-system
+spec:
+  chart: oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+  version: "0.14.2"
+  targetNamespace: arc-runners
+  createNamespace: false
+  valuesContent: |-
+    githubConfigUrl: https://github.com/ergonlabs
+    githubConfigSecret: arc-github-app
+    runnerScaleSetName: ergonlabs-k8s
+
+    minRunners: 0
+    # Each job costs 3 CPU / 6Gi of requests (runner 2/4Gi + dind 0.5/1Gi +
+    # buildkit 0.5/1Gi). 12 => 36 CPU / 72Gi on a 72-core / 252Gi node, which
+    # leaves roughly half the box for the ~28 native Docker containers.
+    # Raised from 4 on 2026-08-13 when sugarmaple-app's CI matrix turned out to
+    # fan out to ~100 jobs.
+    maxRunners: 12
+
+    template:
+      spec:
+        # Do NOT mount a Kubernetes service account token into runner pods.
+        #
+        # This is not just hygiene — it silently breaks workflows that use kubectl
+        # against their OWN cluster (e.g. the E2E job's kind cluster).
+        #
+        # client-go resolves the namespace as: --namespace flag > kubeconfig context
+        # namespace > "default". BUT if the context sets no namespace AND in-cluster
+        # config is "possible" (SA token file present AND KUBERNETES_SERVICE_HOST set,
+        # both of which kubelet gives every pod), it uses the SERVICE ACCOUNT's
+        # namespace instead. In these pods that is "arc-runners".
+        #
+        # So on 2026-08-13 the E2E job's
+        #     kubectl port-forward svc/org-service 3001:3000 &
+        # died with `Error from server (NotFound): namespaces "arc-runners" not found`
+        # against the kind cluster, and the tests failed on ECONNREFUSED. A
+        # GitHub-hosted runner has neither the token nor the env var, so it resolves
+        # to "default" and works — this was purely an artefact of running in-cluster.
+        #
+        # Turning the automount off removes the token file, so Possible() is false and
+        # kubectl falls back to "default" like a hosted runner. Safe here: with
+        # containerMode at its default the chart already assigns the *no-permission*
+        # service account, so the runner never needed API access. (If anything is ever
+        # switched to containerMode: kubernetes, that mode DOES need the token — this
+        # line would have to go.)
+        automountServiceAccountToken: false
+
+        # ---------- init + sidecars ----------
+        initContainers:
+          # Plain init container: seeds the externals dir dind needs.
+          - name: init-dind-externals
+            # Custom image — see runner-image/Dockerfile. The stock
+            # ghcr.io/actions/actions-runner lacks libatomic1, which Node 26 needs.
+            # Both this and the runner container MUST use the same image: the init
+            # container copies /home/runner/externals out of it.
+            image: localhost:5001/ergonlabs/actions-runner:2026-08-13e
+            command: ["cp"]
+            args: ["-r", "-v", "/home/runner/externals/.", "/home/runner/tmpDir/"]
+            env:
+              - name: POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+            volumeMounts:
+              - name: dind-externals
+                mountPath: /home/runner/tmpDir
+                subPathExpr: $(POD_NAME)
+
+          # Native sidecar (restartPolicy: Always) — supported on k8s >= 1.29,
+          # this node is v1.35.5.
+          - name: dind
+            image: docker:dind
+            restartPolicy: Always
+            args:
+              - dockerd
+              - --host=unix:///var/run/docker.sock
+              - --group=$(DOCKER_GROUP_GID)
+              - --data-root=/var/lib/docker
+            env:
+              - name: DOCKER_GROUP_GID
+                value: "123"
+              - name: POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+            securityContext:
+              privileged: true
+            startupProbe:
+              exec:
+                command: ["docker", "info"]
+              initialDelaySeconds: 0
+              failureThreshold: 30
+              periodSeconds: 5
+            resources:
+              requests:
+                cpu: 500m
+                memory: 1Gi
+              limits:
+                memory: 8Gi
+            volumeMounts:
+              - name: work
+                mountPath: /home/runner/_work
+                subPathExpr: $(POD_NAME)
+              - name: dind-sock
+                mountPath: /var/run
+              - name: dind-externals
+                mountPath: /home/runner/externals
+                subPathExpr: $(POD_NAME)
+              - name: docker-store
+                mountPath: /var/lib/docker
+                subPathExpr: $(POD_NAME)
+
+          # BuildKit, for migrating workflows off `docker build` -> `buildx`.
+          - name: buildkitd
+            image: moby/buildkit:latest
+            restartPolicy: Always
+            args:
+              - --addr=unix:///run/buildkit/buildkitd.sock
+              - --root=/var/lib/buildkit
+              # Without this the socket is srw-rw---- root:root and the runner
+              # (uid 1001) gets "context deadline exceeded" trying to connect.
+              # 123 is the docker group the runner image already puts uid 1001 in,
+              # matching DOCKER_GROUP_GID on the dind sidecar.
+              - --group=123
+            env:
+              - name: POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+            securityContext:
+              privileged: true
+            startupProbe:
+              exec:
+                command: ["buildctl", "debug", "workers"]
+              initialDelaySeconds: 0
+              failureThreshold: 30
+              periodSeconds: 5
+            resources:
+              requests:
+                cpu: 500m
+                memory: 1Gi
+              limits:
+                memory: 8Gi
+            volumeMounts:
+              - name: buildkit-sock
+                mountPath: /run/buildkit
+              - name: buildkit-store
+                mountPath: /var/lib/buildkit
+                subPathExpr: $(POD_NAME)
+              - name: work
+                mountPath: /home/runner/_work
+                subPathExpr: $(POD_NAME)
+
+        # ---------- the runner itself ----------
+        containers:
+          - name: runner
+            # Custom image — see runner-image/Dockerfile. The stock
+            # ghcr.io/actions/actions-runner lacks libatomic1, which Node 26 needs.
+            # Both this and the runner container MUST use the same image: the init
+            # container copies /home/runner/externals out of it.
+            image: localhost:5001/ergonlabs/actions-runner:2026-08-13e
+            command: ["/home/runner/run.sh"]
+            env:
+              - name: POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+              - name: DOCKER_HOST
+                value: unix:///var/run/docker.sock
+              - name: RUNNER_WAIT_FOR_DOCKER_IN_SECONDS
+                value: "180"
+              # Lets `buildctl` and `docker buildx --driver remote` find the sidecar.
+              - name: BUILDKIT_HOST
+                value: unix:///run/buildkit/buildkitd.sock
+              # Redirect actions/cache at the in-cluster cache server (40-cache-server.yaml)
+              # so cache traffic stays on the LAN and the data lands on the iSCSI LUN.
+              #
+              # Trailing slash is REQUIRED by the cache server.
+              #
+              # This only works because runner-image/Dockerfile patches
+              # Runner.Worker.dll — otherwise the runner overwrites this value from
+              # the job message and actions/cache silently goes back to GitHub.
+              #
+              # ACTIONS_CACHE_URL is deliberately NOT set: it is the legacy v1
+              # endpoint, which this cache server does not implement. Setting it has
+              # no effect.
+              - name: ACTIONS_RESULTS_URL
+                value: http://arc-cache.arc-runners.svc.cluster.local:3000/
+            resources:
+              requests:
+                cpu: "2"
+                memory: 4Gi
+              limits:
+                memory: 16Gi
+            volumeMounts:
+              - name: work
+                mountPath: /home/runner/_work
+                subPathExpr: $(POD_NAME)
+              - name: dind-sock
+                mountPath: /var/run
+              - name: buildkit-sock
+                mountPath: /run/buildkit
+              # Chromium (Playwright) runs in THIS container and needs a real
+              # /dev/shm. See the volume definition below.
+              - name: dshm
+                mountPath: /dev/shm
+
+        # ---------- storage ----------
+        volumes:
+          # Job workspace -> iSCSI LUN, NOT NFS.
+          #
+          # NFS wins on sequential throughput (564 MB/s vs 69 MB/s for the local
+          # spinning disk) but loses badly on many small files, and CI workspaces
+          # are almost entirely small files. Measured 2026-08-13 restoring the real
+          # 207 MB / 35,883-file pnpm cache from actions/cache:
+          #
+          #     NFS       : 82 s
+          #     iSCSI LUN :  5 s      <- 16x
+          #
+          # That was ~70 s of dead time on every cache-restoring job. An earlier
+          # git-clone benchmark suggested NFS was fine, but it only moved 130 files
+          # and badly under-represented the real workload.
+          - name: work
+            hostPath:
+              path: /mnt/arc-block/work
+              type: Directory
+
+          # Engine state -> iSCSI block device. overlayfs cannot work on NFS.
+          - name: docker-store
+            hostPath:
+              path: /mnt/arc-block/docker
+              type: Directory
+          - name: buildkit-store
+            hostPath:
+              path: /mnt/arc-block/buildkit
+              type: Directory
+          - name: dind-externals
+            hostPath:
+              path: /mnt/arc-block/externals
+              type: Directory
+
+          # Unix sockets only — no payload data, so local emptyDir is fine.
+          - name: dind-sock
+            emptyDir: {}
+          - name: buildkit-sock
+            emptyDir: {}
+
+          # Bigger /dev/shm for Chromium.
+          #
+          # Kubernetes (like Docker) gives a container a 64 MB /dev/shm. Playwright
+          # documents that Chromium is unstable at that size — renderers stall or die,
+          # which surfaces as pages that never finish painting and selector timeouts.
+          # GitHub-hosted runners are VMs where /dev/shm is ~half of RAM, so workflows
+          # are written assuming gigabytes.
+          #
+          # Suspected cause of 2/210 E2E scenarios failing on 2026-08-13, both browser
+          # tests timing out after 15 s on [data-testid="top-bar"] with zero backend
+          # errors, no OOM kills and a healthy cluster. Not proven — but it is a real
+          # divergence from hosted runners that produces exactly this class of
+          # flakiness, and it costs nothing to remove as a variable.
+          #
+          # medium: Memory makes this tmpfs (RAM), and it counts against the runner
+          # container's 16Gi memory limit — 2Gi is comfortably within that.
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 2Gi

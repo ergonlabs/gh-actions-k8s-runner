@@ -1,0 +1,27 @@
+# Install as /etc/sysctl.d/99-kind-inotify.conf  (needs root)
+#
+#   sudo cp ~/k8s/arc/99-kind-inotify.sysctl /etc/sysctl.d/99-kind-inotify.conf
+#   sudo chown root:root /etc/sysctl.d/99-kind-inotify.conf
+#   sudo chmod 0644 /etc/sysctl.d/99-kind-inotify.conf
+#   sudo sysctl --system
+#
+# Raises inotify limits so kind clusters can run inside the CI runner pods.
+#
+# Without this, sugarmaple-app's E2E job fails with:
+#     failed to create fsnotify watcher: too many open files
+# because the doppler-operator can't create watchers, so DopplerSecrets never
+# reach SecretSyncReady and Tilt's `kubectl wait` times out.
+#
+# max_user_instances is a PER-UID limit. Everything kind runs inside the dind
+# sidecar is uid 0 on the host, so all concurrent runners share one budget.
+# Ubuntu's default of 128 is exhausted by a single kind cluster running a full
+# app stack, let alone 12 in parallel.
+#
+# These are small kernel objects; raising the ceiling costs essentially nothing.
+#
+# If you install this, ~/k8s/arc/50-node-tuning.yaml (the DaemonSet that applies
+# the same values from inside k3s) becomes redundant and can be deleted.
+
+fs.inotify.max_user_instances = 8192
+fs.inotify.max_user_watches = 1048576
+fs.inotify.max_queued_events = 65536

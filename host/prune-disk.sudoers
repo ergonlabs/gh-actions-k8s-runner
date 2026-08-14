@@ -1,0 +1,24 @@
+# /etc/sudoers.d/claude-disk-prune
+# Companion drop-in for ~/prune-disk.sh (reclaim / headroom to clear k3s DiskPressure).
+# Composes with /etc/sudoers.d/claude-admin — does NOT replace it. Keep both installed.
+#
+# Only ONE line of prune-disk.sh needs root:
+#     sudo k3s crictl rmi --prune
+# The containerd CRI socket (/run/k3s/containerd/containerd.sock) is root-owned, so the
+# k3s/containerd image prune cannot run as stefanrusek. Everything else in the script is
+# already unprivileged here: `docker system df/prune` works via the docker group, and
+# `kubectl describe node` works because /etc/rancher/k3s/k3s.yaml is mode 0644.
+#
+# NOTE: `k3s` is a multi-call binary (crictl/ctr/kubectl/server/agent are all the same
+# 77 MB ELF), so a blanket `/usr/local/bin/k3s *` would be plain root. The rule below
+# pins the ENTIRE argument vector — no wildcards — so only this exact invocation runs.
+
+# --- k3s/containerd unused-image prune (exact argv, no wildcards) ---
+Cmnd_Alias CLAUDE_PRUNE = /usr/local/bin/k3s crictl rmi --prune
+
+# Belt-and-braces: sudo's env_reset is already the Ubuntu default, but state it for this
+# command so CONTAINER_RUNTIME_ENDPOINT / IMAGE_SERVICE_ENDPOINT / CRI_CONFIG_FILE can
+# never be smuggled in to repoint crictl at an attacker-chosen socket or config.
+Defaults!CLAUDE_PRUNE env_reset
+
+stefanrusek ALL=(root) NOPASSWD: CLAUDE_PRUNE

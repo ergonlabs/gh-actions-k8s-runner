@@ -1,0 +1,161 @@
+# Garbage-collect per-pod runner store directories.
+#
+# WHY THIS IS NEEDED
+#   The runner pods share three hostPath volumes and isolate themselves with
+#   subPathExpr: $(POD_NAME). kubelet CREATES those per-pod subdirectories but
+#   never removes them, so every finished job leaves its stores behind:
+#
+#       /mnt/arc-block/externals/<pod>   ~595 MB   <-- the expensive one
+#       /mnt/arc-block/docker/<pod>      ~13 MB + whatever the build pulled
+#       /mnt/arc-block/buildkit/<pod>    build cache
+#       /mnt/arc-block/work/<pod>        the checkout + restored caches (~1 GB)
+#
+#   That's well over 1 GB per job, so the 251 GB LUN fills fast. This CronJob
+#   deletes any store directory that does not belong to a currently-live pod.
+#   (work/ moved off NFS onto the LUN on 2026-08-13 — NFS made cache restore
+#   82 s vs 5 s. See 20-scale-set.yaml.)
+#
+# Safety: it only ever deletes directories whose names are NOT in the live pod
+# list, so a running job can never have its workspace pulled out from under it.
+# If the pod list can't be fetched, it exits without deleting anything.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: arc-store-gc
+  namespace: arc-runners
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: arc-store-gc
+  namespace: arc-runners
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    # "get" is REQUIRED, not just "list". The sweep re-checks each pod individually
+    # with `kubectl get pod <name>` immediately before deleting its directory. With
+    # only "list", that call fails on RBAC, which the script reads as "pod is gone"
+    # and it deletes the directory of a RUNNING job. The tell is `kept 0` in the
+    # summary line — if the GC never keeps anything, this permission is missing.
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: arc-store-gc
+  namespace: arc-runners
+subjects:
+  - kind: ServiceAccount
+    name: arc-store-gc
+    namespace: arc-runners
+roleRef:
+  kind: Role
+  name: arc-store-gc
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: arc-store-gc
+  namespace: arc-runners
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          serviceAccountName: arc-store-gc
+          restartPolicy: OnFailure
+          securityContext:
+            runAsUser: 0      # the stores are root-owned 0700 (dockerd made them)
+          containers:
+            - name: gc
+              image: bitnami/kubectl:latest
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -uo pipefail
+
+                  # ---------------------------------------------------------------
+                  # CRITICAL: liveness is re-checked immediately before EVERY delete.
+                  #
+                  # The first version of this script snapshotted the live pod list once
+                  # and then deleted for as long as it took. On 2026-08-13 that deleted
+                  # the _work directories of two RUNNING jobs:
+                  #
+                  #   23:00:00Z  GC starts, snapshot = {9kxjg, jvjnv, pnmgb}
+                  #   23:00:37Z  cohort 1 starts on phmmd   <- not in snapshot
+                  #   23:00:42Z  cohort 2 starts on l5965   <- not in snapshot
+                  #              GC deletes for 4m40s (273 dirs)
+                  #   23:03:32Z  both jobs die:
+                  #              spawn .../_work/_tool/node/26.1.0/x64/bin/node ENOENT
+                  #   23:04:40Z  GC completes
+                  #
+                  # A stale snapshot plus a long delete window is a time-of-check-to-
+                  # time-of-use race, and it silently destroys running jobs. Do NOT
+                  # "optimise" this back into a single up-front pod list.
+                  # ---------------------------------------------------------------
+
+                  # Up-front call is a reachability check only — never a delete authority.
+                  if ! kubectl get pods -n arc-runners >/dev/null 2>&1; then
+                      echo "could not list pods — refusing to delete anything"
+                      exit 1
+                  fi
+                  echo "live pods at start (informational only):"
+                  kubectl get pods -n arc-runners \
+                    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | sed 's/^/  /'
+
+                  # Minimum age before a directory is even considered. A pod that has
+                  # just been created may not be visible yet; this keeps us away from
+                  # anything freshly touched.
+                  MIN_AGE_MIN=10
+
+                  FREED=0; KEPT=0; SKIPPED=0
+                  for base in /stores/docker /stores/buildkit /stores/externals /stores/work; do
+                      [ -d "$base" ] || continue
+                      for d in "$base"/*; do
+                          [ -d "$d" ] || continue
+                          name=$(basename "$d")
+                          # Only ever touch things that look like our runner pods.
+                          case "$name" in ergonlabs-k8s-*) ;; *) continue ;; esac
+
+                          # Guard 1: skip anything recently modified.
+                          if [ -n "$(find "$d" -maxdepth 0 -mmin -$MIN_AGE_MIN 2>/dev/null)" ]; then
+                              echo "skip   $d (modified in last ${MIN_AGE_MIN}m)"
+                              SKIPPED=$((SKIPPED + 1)); continue
+                          fi
+
+                          # Guard 2: re-check THIS pod's liveness right now. Authoritative.
+                          if kubectl get pod "$name" -n arc-runners >/dev/null 2>&1; then
+                              echo "keep   $d (pod is live)"
+                              KEPT=$((KEPT + 1)); continue
+                          fi
+
+                          # Guard 3: if the API became unreachable, stop immediately rather
+                          # than treating "cannot tell" as "safe to delete".
+                          if ! kubectl get pods -n arc-runners >/dev/null 2>&1; then
+                              echo "lost API access mid-sweep — stopping without further deletes"
+                              exit 1
+                          fi
+
+                          sz=$(du -sm "$d" 2>/dev/null | cut -f1)
+                          rm -rf "$d" && echo "delete $d (${sz:-?} MB)" \
+                                      && FREED=$((FREED + ${sz:-0}))
+                      done
+                  done
+                  echo "freed ~${FREED} MB; kept $KEPT; skipped $SKIPPED (too recent)"
+                  df -h /stores 2>/dev/null | grep -v '^Filesystem'
+              volumeMounts:
+                - name: stores
+                  mountPath: /stores
+          volumes:
+            # Everything now lives on the LUN, so one mount covers all four stores.
+            - name: stores
+              hostPath:
+                path: /mnt/arc-block
+                type: Directory

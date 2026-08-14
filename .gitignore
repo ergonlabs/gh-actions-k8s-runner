@@ -1,0 +1,15 @@
+# NEVER commit the GitHub App private key.
+*.pem
+*.key
+*.p12
+
+# Local config with real values (copy config.env.example -> config.env)
+config.env
+
+# Scratch
+*.log
+*.tmp
+tmp/
+
+# Ephemeral session-handoff artifacts — never commit
+handoff-*.md

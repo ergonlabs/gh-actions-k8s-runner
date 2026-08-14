@@ -1,0 +1,33 @@
+# Actions Runner Controller — the controller half.
+#
+# Installed via k3s's built-in HelmChart CRD rather than a native `helm` binary,
+# so nothing new lands on the host OS (see CLAUDE.md: only Docker/k3s/SSH/Claude
+# run natively). k3s runs the install in an in-cluster job.
+#
+# Chart version 0.14.2 was the latest on ghcr.io as of 2026-08-13.
+# The controller and the scale set in 20-scale-set.yaml MUST stay on the same
+# version — upgrading one alone breaks the listener.
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: arc-controller
+  namespace: kube-system
+spec:
+  chart: oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller
+  version: "0.14.2"
+  targetNamespace: arc-systems
+  createNamespace: false
+  valuesContent: |-
+    replicaCount: 1
+    # Modest, explicit requests. Nothing else in this cluster sets any, so the
+    # scheduler currently believes the node is empty — give it real numbers.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        memory: 512Mi
+    flags:
+      # Runner pods are cleaned up by the controller; keep logs terse.
+      logLevel: info
+      logFormat: text
