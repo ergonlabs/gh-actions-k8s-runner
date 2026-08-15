@@ -70,10 +70,33 @@ spec:
 
     resources:
       requests:
-        cpu: 250m
+        # Observed ~1.2 CPU under a busy 12-runner pool (2026-08-15) while this
+        # only requested 250m (below the chart's own 500m default) and got no
+        # CPU limit — low shares under contention plus a 1s/3-failure default
+        # probe caused kubelet to kill the pod mid-request, breaking in-flight
+        # `docker buildx build --cache-to type=gha` calls with connection
+        # refused. Node has 72 cores, so headroom isn't the constraint — fair
+        # scheduling share is.
+        cpu: 1000m
         memory: 512Mi
       limits:
         memory: 4Gi
+
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: cache
+      timeoutSeconds: 5
+      periodSeconds: 10
+      failureThreshold: 5
+
+    readinessProbe:
+      httpGet:
+        path: /health
+        port: cache
+      timeoutSeconds: 5
+      periodSeconds: 10
+      failureThreshold: 3
 
     service:
       type: ClusterIP
