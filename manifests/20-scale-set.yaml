@@ -101,17 +101,34 @@ spec:
           - name: dind
             image: docker:dind
             restartPolicy: Always
+            # Wrapped in a shell (was a bare `args:` list using the image's default
+            # entrypoint) to tee dockerd's own output to the LUN — added 2026-08-15
+            # after the dind daemon wedged 4+ times with an identical
+            # docker.sock-closed signature (see arc-dind-wedge-recurring memory) and
+            # every occurrence was unforensicable: the pod (and with it,
+            # /var/log/pods/.../dind/0.log on the node) is deleted essentially in
+            # sync with the pod object, confirmed empirically — node-level log
+            # retention does NOT survive past pod deletion here, so kubectl logs
+            # after the fact is a dead end. This makes the log outlive the pod.
+            # The trap+background+wait dance forwards SIGTERM to dockerd, which
+            # `cmd | tee` alone would swallow (the pipe's shell is PID 1, and
+            # POSIX sh does not forward signals to children by default) — without
+            # it, pod termination would rely on the grace-period SIGKILL instead
+            # of a clean dockerd shutdown.
+            command: ["/bin/sh", "-c"]
             args:
-              - dockerd
-              - --host=unix:///var/run/docker.sock
-              - --group=$(DOCKER_GROUP_GID)
-              - --data-root=/var/lib/docker
-              # Route docker.io pulls through the in-cluster pull-through cache
-              # (45-hub-mirror.yaml) — every pod pulling kindest/node etc. fresh
-              # from one shared egress IP exhausts Hub's anonymous quota (observed
-              # 429s, 2026-08-14). dockerd falls back to Hub if the mirror is down,
-              # so this cannot make pulls less reliable than before.
-              - --registry-mirror=http://arc-hub-mirror.arc-runners.svc.cluster.local:5000
+              - |
+                set -e
+                mkdir -p /dind-logs
+                trap 'kill -TERM "$child" 2>/dev/null' TERM INT
+                dockerd \
+                  --host=unix:///var/run/docker.sock \
+                  --group="$DOCKER_GROUP_GID" \
+                  --data-root=/var/lib/docker \
+                  --registry-mirror=http://arc-hub-mirror.arc-runners.svc.cluster.local:5000 \
+                  2>&1 | tee -a /dind-logs/dockerd.log &
+                child=$!
+                wait "$child"
             env:
               - name: DOCKER_GROUP_GID
                 value: "123"
@@ -144,6 +161,9 @@ spec:
                 subPathExpr: $(POD_NAME)
               - name: docker-store
                 mountPath: /var/lib/docker
+                subPathExpr: $(POD_NAME)
+              - name: dind-logs
+                mountPath: /dind-logs
                 subPathExpr: $(POD_NAME)
 
           # BuildKit, for migrating workflows off `docker build` -> `buildx`.
@@ -279,6 +299,13 @@ spec:
           - name: dind-externals
             hostPath:
               path: /mnt/arc-block/externals
+              type: Directory
+          # Durable dind daemon log — see the dind container's command block
+          # above for why. Small text file, GC'd by 30-store-gc.yaml like every
+          # other per-pod store.
+          - name: dind-logs
+            hostPath:
+              path: /mnt/arc-block/dind-logs
               type: Directory
 
           # Unix sockets only — no payload data, so local emptyDir is fine.

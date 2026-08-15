@@ -52,9 +52,9 @@ mountpoint -q "$ARC_BLOCK_MOUNT" \
        Engine stores MUST be on a block device — overlayfs cannot use an NFS upperdir.
        See docs/findings.md #1, then run: sudo ./host/setup-iscsi.sh"
 
-for d in docker buildkit externals work; do
+for d in docker buildkit externals work dind-logs; do
   [ -d "$ARC_BLOCK_MOUNT/$d" ] \
-    || die "$ARC_BLOCK_MOUNT/$d missing. Create the four store dirs INSIDE the mount (mode 0777).
+    || die "$ARC_BLOCK_MOUNT/$d missing. Create the store dirs INSIDE the mount (mode 0777).
        They live inside the mount on purpose: hostPath type: Directory then fails loudly if
        the device is not mounted, instead of silently filling the local disk."
 done

@@ -104,7 +104,7 @@ data:
     MIN_AGE_MIN=10
 
     FREED=0; KEPT=0; SKIPPED=0
-    for base in /stores/docker /stores/buildkit /stores/externals /stores/work; do
+    for base in /stores/docker /stores/buildkit /stores/externals /stores/work /stores/dind-logs; do
         [ -d "$base" ] || continue
         for d in "$base"/*; do
             [ -d "$d" ] || continue

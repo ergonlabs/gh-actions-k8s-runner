@@ -46,7 +46,7 @@ step "Host"
 mountpoint -q "$ARC_BLOCK_MOUNT" \
   && ok "$ARC_BLOCK_MOUNT mounted ($(df -h "$ARC_BLOCK_MOUNT" | awk 'NR==2{print $4" free"}'))" \
   || bad "$ARC_BLOCK_MOUNT NOT mounted — pods will fail (by design)"
-for d in docker buildkit externals work hub-mirror; do
+for d in docker buildkit externals work hub-mirror dind-logs; do
   [ -d "$ARC_BLOCK_MOUNT/$d" ] && ok "store dir $d" || bad "store dir $d missing"
 done
 INST=$(cat /proc/sys/fs/inotify/max_user_instances 2>/dev/null || echo 0)
@@ -139,6 +139,14 @@ else
   BK=$(kubectl exec -n arc-runners "$POD" -c buildkitd -- cat /etc/buildkit/buildkitd.toml 2>/dev/null)
   echo "$BK" | grep -q 'arc-hub-mirror' \
     && ok "buildkitd mirror config mounted" || bad "buildkitd config missing arc-hub-mirror (ConfigMap not mounted?)"
+
+  # dind's own log must be landing on the LUN (durable across pod deletion),
+  # not just going to container stdout — findings: node-level /var/log/pods
+  # is deleted essentially in sync with the pod, so this is the only copy
+  # that survives a wedge long enough to investigate.
+  DL=$(kubectl exec -n arc-runners "$POD" -c dind -- sh -c 'wc -c < /dind-logs/dockerd.log' 2>/dev/null)
+  [ "${DL:-0}" -gt 0 ] 2>/dev/null \
+    && ok "dind log capture active ($DL bytes)" || bad "dind log capture empty/missing — wedges will be unforensicable again"
 fi
 
 kubectl patch autoscalingrunnerset "$RUNNER_SCALE_SET_NAME" -n arc-runners --type=merge \
