@@ -114,6 +114,14 @@ if [ ! -d "$ARC_BLOCK_MOUNT/cache" ]; then
 fi
 K apply -f manifests/40-cache-server.yaml
 
+# ---------------------------------------------------------------- hub mirror
+step "Docker Hub pull-through cache"
+if [ ! -d "$ARC_BLOCK_MOUNT/hub-mirror" ]; then
+  echo "  NOTE: $ARC_BLOCK_MOUNT/hub-mirror missing — the mirror pod will not start until it exists:"
+  echo "      $DOCKER run --rm -v $ARC_BLOCK_MOUNT:/b alpine sh -c 'mkdir -p /b/hub-mirror'"
+fi
+K apply -f manifests/45-hub-mirror.yaml
+
 # ---------------------------------------------------------------- scale set
 step "Runner scale set ($RUNNER_SCALE_SET_NAME)"
 K apply -f manifests/20-scale-set.yaml

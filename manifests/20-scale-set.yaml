@@ -106,6 +106,12 @@ spec:
               - --host=unix:///var/run/docker.sock
               - --group=$(DOCKER_GROUP_GID)
               - --data-root=/var/lib/docker
+              # Route docker.io pulls through the in-cluster pull-through cache
+              # (45-hub-mirror.yaml) — every pod pulling kindest/node etc. fresh
+              # from one shared egress IP exhausts Hub's anonymous quota (observed
+              # 429s, 2026-08-14). dockerd falls back to Hub if the mirror is down,
+              # so this cannot make pulls less reliable than before.
+              - --registry-mirror=http://arc-hub-mirror.arc-runners.svc.cluster.local:5000
             env:
               - name: DOCKER_GROUP_GID
                 value: "123"
@@ -152,6 +158,10 @@ spec:
               # 123 is the docker group the runner image already puts uid 1001 in,
               # matching DOCKER_GROUP_GID on the dind sidecar.
               - --group=123
+              # buildkitd has no --registry-mirror flag; docker.io mirroring lives
+              # in this file config (ConfigMap in 45-hub-mirror.yaml). BuildKit
+              # falls back to the upstream registry if the mirror errors.
+              - --config=/etc/buildkit/buildkitd.toml
             env:
               - name: POD_NAME
                 valueFrom:
@@ -180,6 +190,8 @@ spec:
               - name: work
                 mountPath: /home/runner/_work
                 subPathExpr: $(POD_NAME)
+              - name: buildkitd-config
+                mountPath: /etc/buildkit
 
         # ---------- the runner itself ----------
         containers:
@@ -274,6 +286,11 @@ spec:
             emptyDir: {}
           - name: buildkit-sock
             emptyDir: {}
+
+          # docker.io mirror config for buildkitd (45-hub-mirror.yaml).
+          - name: buildkitd-config
+            configMap:
+              name: arc-buildkitd-config
 
           # Bigger /dev/shm for Chromium.
           #

@@ -36,13 +36,15 @@ kubectl get ds arc-node-tuning -n arc-systems >/dev/null 2>&1 \
   && ok "node-tuning DaemonSet present" || bad "node-tuning missing — kind-in-CI will fail"
 kubectl get svc arc-cache -n arc-runners >/dev/null 2>&1 \
   && ok "cache server service present" || bad "cache server missing"
+kubectl get svc arc-hub-mirror -n arc-runners >/dev/null 2>&1 \
+  && ok "hub mirror service present" || bad "hub mirror missing — Docker Hub 429s will return"
 
 # ---------------------------------------------------------------- host
 step "Host"
 mountpoint -q "$ARC_BLOCK_MOUNT" \
   && ok "$ARC_BLOCK_MOUNT mounted ($(df -h "$ARC_BLOCK_MOUNT" | awk 'NR==2{print $4" free"}'))" \
   || bad "$ARC_BLOCK_MOUNT NOT mounted — pods will fail (by design)"
-for d in docker buildkit externals work; do
+for d in docker buildkit externals work hub-mirror; do
   [ -d "$ARC_BLOCK_MOUNT/$d" ] && ok "store dir $d" || bad "store dir $d missing"
 done
 INST=$(cat /proc/sys/fs/inotify/max_user_instances 2>/dev/null || echo 0)
@@ -122,6 +124,19 @@ else
   # cache server reachable from the pod
   H=$(kubectl exec -n arc-runners "$POD" -c runner -- curl -s -m 10 http://arc-cache.arc-runners.svc.cluster.local:3000/health 2>/dev/null)
   [ "$H" = "healthy" ] && ok "cache server reachable and healthy" || bad "cache server health = ${H:-<no response>}"
+
+  # dockerd must actually be using the hub mirror — check the effect (docker info),
+  # not the manifest: a typo'd flag or an old pod would pass a config-only check.
+  chk "dockerd registry mirror configured"               'docker info 2>/dev/null | grep -A2 "Registry Mirrors"' 'arc-hub-mirror'
+
+  # hub mirror reachable from the pod (HTTP 200 on the registry API root)
+  M=$(kubectl exec -n arc-runners "$POD" -c runner -- curl -s -o /dev/null -w '%{http_code}' -m 10 http://arc-hub-mirror.arc-runners.svc.cluster.local:5000/v2/ 2>/dev/null)
+  [ "$M" = "200" ] && ok "hub mirror reachable (HTTP $M)" || bad "hub mirror /v2/ = ${M:-<no response>}"
+
+  # buildkitd must have the mirror config mounted AND loaded
+  BK=$(kubectl exec -n arc-runners "$POD" -c buildkitd -- cat /etc/buildkit/buildkitd.toml 2>/dev/null)
+  echo "$BK" | grep -q 'arc-hub-mirror' \
+    && ok "buildkitd mirror config mounted" || bad "buildkitd config missing arc-hub-mirror (ConfigMap not mounted?)"
 fi
 
 kubectl patch autoscalingrunnerset "$RUNNER_SCALE_SET_NAME" -n arc-runners --type=merge \
