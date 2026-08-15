@@ -38,6 +38,8 @@ kubectl get svc arc-cache -n arc-runners >/dev/null 2>&1 \
   && ok "cache server service present" || bad "cache server missing"
 kubectl get svc arc-hub-mirror -n arc-runners >/dev/null 2>&1 \
   && ok "hub mirror service present" || bad "hub mirror missing — Docker Hub 429s will return"
+kubectl get deploy arc-store-gc-pressure -n arc-runners -o jsonpath='{.status.readyReplicas}' 2>/dev/null | grep -q '^1$' \
+  && ok "store-gc pressure watcher running" || bad "pressure watcher not ready — ENOSPC bursts won't get a fast reaction"
 
 # ---------------------------------------------------------------- host
 step "Host"

@@ -1,0 +1,71 @@
+# Reactive companion to 30-store-gc.yaml's CronJob.
+#
+# WHY
+#   The */5 scheduled cadence (itself tightened from */15 on 2026-08-14) still
+#   wasn't fast enough under peak concurrent-PR load: the LUN hit ENOSPC three
+#   times in two days (2026-08-14 x2, 2026-08-15), each time self-healing only
+#   once a scheduled or manually-triggered sweep ran. A fixed interval can't
+#   react faster than its own period, and this failure is burst-shaped, not
+#   steady-state — a handful of concurrent E2E cohorts can fill tens of GB in
+#   under a minute.
+#
+#   This Deployment polls disk usage every 30s and runs the SAME GC script
+#   (shared via the arc-store-gc-script ConfigMap in 30-store-gc.yaml)
+#   immediately when usage crosses 90%, instead of waiting for the next
+#   scheduled tick. The CronJob stays as-is — this is a faster-reacting
+#   backstop layered on top, not a replacement.
+#
+# SAFETY
+#   Uses the exact same gc.sh as the CronJob, including its live-pod
+#   liveness re-check before every delete. Runs under the same
+#   arc-store-gc ServiceAccount/Role (get/list pods) — no new RBAC surface,
+#   and deliberately no Job-create permission: this container execs the
+#   script in-process rather than spawning a Job, so it never needs API
+#   write access at all.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arc-store-gc-pressure
+  namespace: arc-runners
+  labels:
+    app: arc-store-gc-pressure
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: arc-store-gc-pressure
+  template:
+    metadata:
+      labels:
+        app: arc-store-gc-pressure
+    spec:
+      # NOTE: unlike arc-hub-mirror, this pod genuinely needs API access
+      # (gc.sh calls `kubectl get pods`) — do not set
+      # automountServiceAccountToken: false here.
+      serviceAccountName: arc-store-gc
+      containers:
+        - name: watch
+          image: bitnami/kubectl:latest
+          command: ["/bin/bash", "/scripts/watch.sh"]
+          securityContext:
+            runAsUser: 0      # gc.sh needs this — see 30-store-gc.yaml
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: stores
+              mountPath: /stores
+            - name: gc-script
+              mountPath: /scripts
+      volumes:
+        - name: stores
+          hostPath:
+            path: /mnt/arc-block
+            type: Directory
+        - name: gc-script
+          configMap:
+            name: arc-store-gc-script
+            defaultMode: 0755

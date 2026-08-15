@@ -128,6 +128,7 @@ K apply -f manifests/20-scale-set.yaml
 
 step "Per-pod store GC (NOT optional — see docs/findings.md #7)"
 K apply -f manifests/30-store-gc.yaml
+K apply -f manifests/35-store-gc-pressure.yaml
 
 # ---------------------------------------------------------------- done
 step "Done"
