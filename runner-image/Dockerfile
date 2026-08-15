@@ -167,6 +167,14 @@ RUN set -eux; \
 # per-job). A standalone tarball (not apt's `nodejs` package) so there's no
 # large `node-*` library dependency tree to purge afterward — an earlier
 # apt-based version of this step took ~15 minutes just to uninstall.
+#
+# The final chown MUST cover /home/runner/.cache itself, not just the
+# ms-playwright subdir under it. An earlier version only chowned
+# ms-playwright, leaving .cache root:root 0755 — the runner user could list
+# it but not create new entries, so actions/cache restoring ANY other cache
+# under .cache/ (e.g. Go's build cache) failed with
+# `mkdir /home/runner/.cache/go-build: permission denied`. Broke the
+# git-service Go quality gates job in production on 2026-08-14.
 ARG PLAYWRIGHT_VERSION=1.60.0
 ARG NODE_VERSION=24.19.0
 ENV PLAYWRIGHT_BROWSERS_PATH=/home/runner/.cache/ms-playwright
@@ -180,7 +188,7 @@ RUN set -eux; \
     playwright install --with-deps chromium; \
     rm -rf /tmp/node.tar.xz /tmp/node; \
     apt-get clean && rm -rf /var/lib/apt/lists/*; \
-    chown -R runner:runner /home/runner/.cache/ms-playwright
+    chown -R runner:runner /home/runner/.cache
 
 # ---------------------------------------------------------------------------
 # Redirect actions/cache to the in-cluster cache server.
