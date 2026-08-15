@@ -30,13 +30,24 @@
 #   are untouched (and don't rate-limit anonymous pulls the way Hub does).
 #
 # WHAT IT DOES NOT DO
-#   - No authentication to Docker Hub: the proxy pulls anonymously, so the *mirror
-#     host* is still subject to Hub's anonymous quota for cache MISSES. That is the
-#     point — misses happen once per image per TTL instead of once per job. If quota
-#     is ever hit again, add REGISTRY_PROXY_USERNAME / REGISTRY_PROXY_PASSWORD from
-#     a secret for the authenticated (higher) quota.
 #   - It is NOT the workflows' localhost:5001 kind-registry — that one runs inside
 #     each job's dind for `--push`ing locally-built images and stays as is.
+#
+# AUTH (added 2026-08-15)
+#   The proxy authenticates to Docker Hub via REGISTRY_PROXY_USERNAME/PASSWORD,
+#   sourced from the `arc-hub-mirror-credentials` Secret (created out-of-band,
+#   NOT in this repo — see the env block below for the exact kubectl command).
+#   Originally this ran anonymous, on the theory that cache MISSES happening
+#   once per image per TTL (instead of once per job) would stay under Hub's
+#   anonymous per-IP quota. That held under normal load but broke on
+#   2026-08-15: a Redpanda-driven wave of cache misses exhausted the quota
+#   anyway, and since the mirror shares the pool's one egress IP, its own
+#   upstream fetches got 429'd — which cascaded to dockerd/buildkitd falling
+#   back to a DIRECT Hub pull that also 429'd (verified in sugarmaple-app run
+#   31882219732: `node:26-slim` resolve, `429 Too Many Requests` straight from
+#   registry-1.docker.io). Authenticated pulls get Hub's per-USER quota
+#   instead, which is materially higher. If that's ever exhausted too, the
+#   next lever is a paid Hub plan, not more infra.
 #
 # STORAGE
 #   Cached blobs -> iSCSI LUN via hostPath, same fail-loud pattern as every other
@@ -77,6 +88,23 @@ spec:
             # reclaims the bytes — the LUN would grow without bound.
             - name: REGISTRY_STORAGE_DELETE_ENABLED
               value: "true"
+            # Authenticated pulls get Docker Hub's higher per-user quota instead of
+            # the anonymous per-IP one. Added 2026-08-15 after the anonymous mirror
+            # itself got 429'd on a cache miss — see docs/findings.md. Secret is
+            # created out-of-band (kubectl create secret, not committed here):
+            #   kubectl create secret generic arc-hub-mirror-credentials -n arc-runners \
+            #     --from-literal=username=<dockerhub-username> \
+            #     --from-file=password=<path-to-token-file>
+            - name: REGISTRY_PROXY_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: arc-hub-mirror-credentials
+                  key: username
+            - name: REGISTRY_PROXY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: arc-hub-mirror-credentials
+                  key: password
           ports:
             - containerPort: 5000
           readinessProbe:
