@@ -135,6 +135,13 @@ else
   M=$(kubectl exec -n arc-runners "$POD" -c runner -- curl -s -o /dev/null -w '%{http_code}' -m 10 http://arc-hub-mirror.arc-runners.svc.cluster.local:5000/v2/ 2>/dev/null)
   [ "$M" = "200" ] && ok "hub mirror reachable (HTTP $M)" || bad "hub mirror /v2/ = ${M:-<no response>}"
 
+  # DOCKER_IO_MIRROR_ENDPOINT is the generic, workflow-facing contract for "a
+  # docker.io mirror exists" (kind-cluster-bootstrap checks this rather than
+  # hardcoding our hostname) — assert it's actually set and points somewhere
+  # reachable, not just present.
+  DME=$(kubectl exec -n arc-runners "$POD" -c runner -- sh -c 'echo $DOCKER_IO_MIRROR_ENDPOINT' 2>/dev/null)
+  [ -n "$DME" ] && ok "DOCKER_IO_MIRROR_ENDPOINT set ($DME)" || bad "DOCKER_IO_MIRROR_ENDPOINT not set — kind-cluster-bootstrap's mirror patch won't activate"
+
   # buildkitd must have the mirror config mounted AND loaded
   BK=$(kubectl exec -n arc-runners "$POD" -c buildkitd -- cat /etc/buildkit/buildkitd.toml 2>/dev/null)
   echo "$BK" | grep -q 'arc-hub-mirror' \

@@ -234,6 +234,15 @@ spec:
               # Lets `buildctl` and `docker buildx --driver remote` find the sidecar.
               - name: BUILDKIT_HOST
                 value: unix:///run/buildkit/buildkitd.sock
+              # Generic interface for "is a docker.io pull-through cache available".
+              # Workflows should check for this being set rather than hardcoding our
+              # hostname — same contract as BUILDKIT_HOST above. Added 2026-08-16:
+              # dind's own --registry-mirror flag doesn't cover pulls made by kind's
+              # nested containerd (a separate pull path, same as buildx's own separate
+              # path), so kind-cluster-bootstrap needs this to mirror docker.io inside
+              # the kind cluster too. See arc-buildx-and-kind-mirror-gaps memory.
+              - name: DOCKER_IO_MIRROR_ENDPOINT
+                value: http://arc-hub-mirror.arc-runners.svc.cluster.local:5000
               # Redirect actions/cache at the in-cluster cache server (40-cache-server.yaml)
               # so cache traffic stays on the LAN and the data lands on the iSCSI LUN.
               #
