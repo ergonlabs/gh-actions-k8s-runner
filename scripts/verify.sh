@@ -30,6 +30,10 @@ kubectl get autoscalingrunnerset "$RUNNER_SCALE_SET_NAME" -n arc-runners >/dev/n
   && ok "scale set $RUNNER_SCALE_SET_NAME exists" || bad "scale set missing"
 kubectl get pods -n arc-systems 2>/dev/null | grep -q "$RUNNER_SCALE_SET_NAME.*listener.*Running" \
   && ok "listener Running (authenticated to GitHub)" || bad "listener not Running — check App permissions"
+kubectl get autoscalingrunnerset "$RUNNER_SCALE_SET_NAME_SMALL" -n arc-runners >/dev/null 2>&1 \
+  && ok "scale set $RUNNER_SCALE_SET_NAME_SMALL exists" || bad "small scale set missing"
+kubectl get pods -n arc-systems 2>/dev/null | grep -q "$RUNNER_SCALE_SET_NAME_SMALL.*listener.*Running" \
+  && ok "small listener Running (authenticated to GitHub)" || bad "small listener not Running — check App permissions"
 kubectl get cronjob arc-store-gc -n arc-runners >/dev/null 2>&1 \
   && ok "store GC CronJob present" || bad "store GC missing — the block device WILL fill"
 kubectl get ds arc-node-tuning -n arc-systems >/dev/null 2>&1 \
@@ -163,8 +167,57 @@ kubectl patch autoscalingrunnerset "$RUNNER_SCALE_SET_NAME" -n arc-runners --typ
   -p "{\"spec\":{\"minRunners\":${PREV:-0}}}" >/dev/null 2>&1
 echo "  (restored minRunners=${PREV:-0})"
 
+# ---------------------------------------------------------------- in-pod (small)
+step "In-pod invariants, small pool (spawning one runner)"
+PREV_SMALL=$(kubectl get autoscalingrunnerset "$RUNNER_SCALE_SET_NAME_SMALL" -n arc-runners -o jsonpath='{.spec.minRunners}' 2>/dev/null)
+kubectl patch autoscalingrunnerset "$RUNNER_SCALE_SET_NAME_SMALL" -n arc-runners --type=merge \
+  -p '{"spec":{"minRunners":1}}' >/dev/null 2>&1
+SPOD=""
+for _ in $(seq 1 60); do
+  SPOD=$(kubectl get pods -n arc-runners --no-headers 2>/dev/null | grep "$RUNNER_SCALE_SET_NAME_SMALL" | grep '1/1 *Running' | awk '{print $1}' | head -1)
+  [ -n "$SPOD" ] && break; sleep 5
+done
+
+if [ -z "$SPOD" ]; then
+  bad "no small-pool runner pod reached 1/1 Running in 5min"
+else
+  ok "small-pool runner pod $SPOD is 1/1 Running"
+
+  # Deliberately no docker/dind at all in this pool — assert its absence, not
+  # just its presence elsewhere. A dind sidecar accidentally reappearing here
+  # would silently double this pool's per-pod resource footprint.
+  if kubectl exec -n arc-runners "$SPOD" -c runner -- test -S /var/run/docker.sock 2>/dev/null; then
+    bad "docker.sock exists in the small pool — dind snuck back in, sizing math is now wrong"
+  else
+    ok "no docker.sock (small pool correctly has no dind sidecar)"
+  fi
+
+  SH=$(kubectl exec -n arc-runners "$SPOD" -c runner -- printenv ACTIONS_RESULTS_URL 2>/dev/null)
+  echo "$SH" | grep -q 'arc-cache' \
+    && ok "cache redirected to in-cluster server (small pool)" \
+    || bad "small pool cache redirect missing — got: ${SH:-<empty>}"
+
+  SHH=$(kubectl exec -n arc-runners "$SPOD" -c runner -- curl -s -m 10 http://arc-cache.arc-runners.svc.cluster.local:3000/health 2>/dev/null)
+  [ "$SHH" = "healthy" ] && ok "cache server reachable and healthy (small pool)" || bad "small pool cache server health = ${SHH:-<no response>}"
+
+  SWORK=$(kubectl exec -n arc-runners "$SPOD" -c runner -- df -h /home/runner/_work 2>/dev/null | tail -1 | awk '{print $1}')
+  echo "$SWORK" | grep -q '^/dev/' \
+    && ok "_work on block device, NOT nfs (small pool)" \
+    || bad "small pool _work not on block device — got: ${SWORK:-<empty>}"
+
+  if kubectl exec -n arc-runners "$SPOD" -c runner -- test -f /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null; then
+    bad "service account token IS mounted in small pool — kubectl in workflows will target the runner namespace (findings #9)"
+  else
+    ok "no service account token mounted (small pool)"
+  fi
+fi
+
+kubectl patch autoscalingrunnerset "$RUNNER_SCALE_SET_NAME_SMALL" -n arc-runners --type=merge \
+  -p "{\"spec\":{\"minRunners\":${PREV_SMALL:-0}}}" >/dev/null 2>&1
+echo "  (restored small pool minRunners=${PREV_SMALL:-0})"
+
 # ---------------------------------------------------------------- summary
 step "Summary"
 printf '  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || { echo "  See docs/findings.md for what each check protects against."; exit 1; }
-echo "  All good. Trigger a workflow with: runs-on: $RUNNER_SCALE_SET_NAME"
+echo "  All good. Trigger a workflow with: runs-on: $RUNNER_SCALE_SET_NAME (large) or runs-on: $RUNNER_SCALE_SET_NAME_SMALL (small)"

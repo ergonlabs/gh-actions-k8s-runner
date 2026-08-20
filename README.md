@@ -1,16 +1,23 @@
 # arc-infra
 
 GitHub Actions self-hosted runners on k3s, using [Actions Runner
-Controller](https://github.com/actions/actions-runner-controller). Each job gets a fresh pod
-with Docker (dind), BuildKit, and a Kubernetes toolchain matching GitHub's hosted
-`ubuntu-latest` image.
+Controller](https://github.com/actions/actions-runner-controller). Two pools since
+2026-08-20:
+
+- **`ergonlabs-k8s`** (large) — a fresh pod per job with Docker (dind), BuildKit, and a
+  Kubernetes toolchain matching GitHub's hosted `ubuntu-latest` image. For jobs that build
+  Docker images or run kind.
+- **`ergonlabs-k8s-small`** — runner container only, no Docker at all. For jobs that never
+  touch Docker (lint/typecheck/test/build) — lighter pods, higher `maxRunners`.
 
 Workflows opt in with:
 
 ```yaml
 jobs:
-  build:
+  build-docker-image:            # or anything needing kind/dind/buildx
     runs-on: ergonlabs-k8s
+  lint-and-test:                 # anything that never touches Docker
+    runs-on: ergonlabs-k8s-small
 ```
 
 Everything needed to recreate this from scratch is in this repo. **No secrets are committed** —
@@ -23,7 +30,7 @@ cp config.env.example config.env && $EDITOR config.env
 
 sudo ./host/setup-iscsi.sh      # one-time: attach the block device (needs root)
 ./scripts/install.sh            # everything else
-./scripts/verify.sh             # 25+ checks incl. in-pod invariants
+./scripts/verify.sh             # 45+ checks incl. in-pod invariants for both pools
 ```
 
 See [docs/prerequisites.md](docs/prerequisites.md) for what must exist first — a block
@@ -34,11 +41,15 @@ device, a GitHub App, and a registry.
 | Component | Where | Purpose |
 |---|---|---|
 | ARC controller | `arc-systems` | reconciles runner scale sets |
-| `ergonlabs-k8s` listener | `arc-systems` | long-polls GitHub for jobs, scales 0→N |
-| runner pods | `arc-runners` | ephemeral, one per job; runner + dind + buildkitd |
-| `arc-cache` | `arc-runners` | self-hosted `actions/cache` server |
+| `ergonlabs-k8s` listener | `arc-systems` | large pool: long-polls GitHub for jobs, scales 0→3 |
+| `ergonlabs-k8s-small` listener | `arc-systems` | small pool: long-polls GitHub for jobs, scales 0→30 |
+| large-pool runner pods | `arc-runners` | ephemeral, one per job; runner + dind + buildkitd |
+| small-pool runner pods | `arc-runners` | ephemeral, one per job; runner only, no Docker |
+| `arc-cache` | `arc-runners` | self-hosted `actions/cache` server, shared by both pools |
+| `arc-hub-mirror` | `arc-runners` | authenticated Docker Hub pull-through cache |
 | `arc-store-gc` | `arc-runners` | CronJob reclaiming per-pod dirs (**not optional**) |
-| `arc-node-tuning` | `arc-systems` | DaemonSet raising host inotify limits |
+| `arc-store-gc-pressure` | `arc-runners` | reactive companion to arc-store-gc, triggers on disk pressure |
+| `arc-node-tuning` | `arc-systems` | DaemonSet raising host inotify + AIO limits |
 
 Charts are installed through k3s's built-in `HelmChart` CRD, so **no native `helm` binary is
 added to the host**.
@@ -49,7 +60,8 @@ ARC needs **no ports, no Ingress, no NodePort** — it long-polls outbound only.
 
 ```
 manifests/       numbered, apply in order
-  00-namespaces  10-controller  20-scale-set  30-store-gc  40-cache-server  50-node-tuning
+  00-namespaces  10-controller  20-scale-set  21-scale-set-small  30-store-gc
+  35-store-gc-pressure  40-cache-server  45-hub-mirror  50-node-tuning
 runner-image/    Dockerfile for the custom runner image
 host/            things that need root: iSCSI setup, sysctl drop-in, sudoers drop-in
 scripts/         install.sh, verify.sh
@@ -59,7 +71,7 @@ config.env       your values (gitignored; copy from config.env.example)
 
 ## Read this before changing anything
 
-**[docs/findings.md](docs/findings.md)** documents 13 non-obvious problems hit while building
+**[docs/findings.md](docs/findings.md)** documents 14 non-obvious problems hit while building
 this, with evidence. Most of the strange-looking choices in the manifests are load-bearing.
 The short version:
 

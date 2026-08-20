@@ -122,9 +122,12 @@ if [ ! -d "$ARC_BLOCK_MOUNT/hub-mirror" ]; then
 fi
 K apply -f manifests/45-hub-mirror.yaml
 
-# ---------------------------------------------------------------- scale set
-step "Runner scale set ($RUNNER_SCALE_SET_NAME)"
+# ---------------------------------------------------------------- scale sets
+step "Runner scale set ($RUNNER_SCALE_SET_NAME, large/dind+buildkit)"
 K apply -f manifests/20-scale-set.yaml
+
+step "Runner scale set ($RUNNER_SCALE_SET_NAME_SMALL, small/no-docker)"
+K apply -f manifests/21-scale-set-small.yaml
 
 step "Per-pod store GC (NOT optional — see docs/findings.md #7)"
 K apply -f manifests/30-store-gc.yaml
@@ -138,11 +141,14 @@ Verify with:   ./scripts/verify.sh
 Workflows target these runners with:
 
     jobs:
-      build:
+      build-docker-image:            # or anything needing kind/dind/buildx
         runs-on: $RUNNER_SCALE_SET_NAME
+      lint-and-test:                 # anything that never touches Docker
+        runs-on: $RUNNER_SCALE_SET_NAME_SMALL
 
-The listener may take a minute to register. Watch it:
+Both listeners may take a minute to register. Watch them:
 
     kubectl get autoscalingrunnerset -n arc-runners
     kubectl logs -n arc-systems -l actions.github.com/scale-set-name=$RUNNER_SCALE_SET_NAME --tail=20
+    kubectl logs -n arc-systems -l actions.github.com/scale-set-name=$RUNNER_SCALE_SET_NAME_SMALL --tail=20
 EOF

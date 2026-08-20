@@ -40,12 +40,15 @@ spec:
     runnerScaleSetName: ergonlabs-k8s
 
     minRunners: 0
-    # Each job costs 3 CPU / 6Gi of requests (runner 2/4Gi + dind 0.5/1Gi +
-    # buildkit 0.5/1Gi). 12 => 36 CPU / 72Gi on a 72-core / 252Gi node, which
-    # leaves roughly half the box for the ~28 native Docker containers.
-    # Raised from 4 on 2026-08-13 when sugarmaple-app's CI matrix turned out to
-    # fan out to ~100 jobs.
-    maxRunners: 12
+    # Was 12 (raised from 4 on 2026-08-13 for a ~100-job matrix). Dropped to 3 on
+    # 2026-08-20 alongside adding 21-scale-set-small.yaml: sugarmaple-app's CI
+    # (062 plan-4, 2026-08-19) collapsed the old workspace x task matrix and 3
+    # E2E cohorts into ~24-44 small per-workspace jobs (now routed to the small
+    # pool) + exactly 1 big e2e-tests job per run. This pool only needs enough
+    # headroom for a handful of runs' E2E jobs overlapping across concurrent
+    # PRs, not the old per-cohort fan-out. See 21-scale-set-small.yaml for the
+    # combined sizing math against node capacity.
+    maxRunners: 3
 
     template:
       spec:
@@ -148,7 +151,12 @@ spec:
               requests:
                 cpu: 500m
                 memory: 1Gi
+              # CPU limit added 2026-08-20 — there was none before (memory-only),
+              # a real gap flagged back in the original two-pool sizing
+              # discussion. 2 CPU is 4x the request, matching the existing
+              # memory-limit-to-request ratio elsewhere in this file.
               limits:
+                cpu: "2"
                 memory: 8Gi
             volumeMounts:
               - name: work
@@ -199,7 +207,9 @@ spec:
               requests:
                 cpu: 500m
                 memory: 1Gi
+              # CPU limit added 2026-08-20 — see the dind container above for why.
               limits:
+                cpu: "2"
                 memory: 8Gi
             volumeMounts:
               - name: buildkit-sock
@@ -261,7 +271,9 @@ spec:
               requests:
                 cpu: "2"
                 memory: 4Gi
+              # CPU limit added 2026-08-20 — see the dind container above for why.
               limits:
+                cpu: "4"
                 memory: 16Gi
             volumeMounts:
               - name: work

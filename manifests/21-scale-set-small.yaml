@@ -1,0 +1,119 @@
+# Runner scale set "ergonlabs-k8s-small" — workflows use `runs-on: ergonlabs-k8s-small`.
+#
+# WHY A SECOND POOL
+#   Added 2026-08-20. sugarmaple-app's CI (062 plan-4, merged 2026-08-19) collapsed the
+#   old workspace x task matrix into one job per workspace (lint -> typecheck -> test ->
+#   build sequentially) and the 3 E2E cohorts into one e2e-tests job. That reshaped the
+#   job mix from ~125 tiny jobs + 3 big ones to ~24-44 medium jobs (depends on how many
+#   workspaces are affected; 43 TS/JS workspaces + 1 Go job is the ceiling on a full run)
+#   + 1 big one — the two-large-scale-sets-with-per-set-limits design floated back on
+#   2026-08-14 (see arc-runner-sizing-decision memory) finally fits the actual shape of
+#   the work, so it's implemented now.
+#
+#   The 24-44 per-workspace jobs run entirely in Node/pnpm — eslint, tsc, vitest, vite
+#   build. None of them touch Docker: no `docker build`, no kind, no Tilt. Confirmed by
+#   reading package-gates/action.yml and every workspace's package.json scripts before
+#   building this — there is no dind or buildkitd sidecar here at all, unlike
+#   20-scale-set.yaml's pool. That's not just a resource trim, it's a real simplification:
+#   no LUN-backed engine stores, no registry-mirror config, nothing overlayfs-on-NFS-shaped
+#   to worry about for this pool.
+#
+#   These jobs moved OFF this box entirely onto GitHub-hosted ubuntu-latest in the same
+#   062 plan-4 refactor (explicitly operator-requested at the time, to keep the
+#   self-hosted pool reserved for the one job that actually needed it). Moving them back
+#   here now is a deliberate reversal of that, made explicitly by the owner on 2026-08-20:
+#   with only ~1 E2E job per run instead of 3 concurrent cohorts, the self-hosted pool has
+#   real spare capacity, and self-hosted is faster (in-cluster actions/cache server,
+#   custom runner image with tools pre-baked) even though each individual job now takes a
+#   bit longer locally than before (each job pays setup once and runs 4 gates instead of
+#   spawning 4 parallel one-gate jobs) — total wall-clock run time still drops, and these
+#   jobs run concurrently with the E2E job anyway, so they have buffer.
+#
+# SIZING
+#   30 max here + 3 max in 20-scale-set.yaml's pool. Worst-case resource ceiling (all
+#   containers in all pods hitting their LIMIT simultaneously, the true pathological
+#   case, not steady state): this pool ~30 CPU / ~90Gi, the large pool ~24 CPU / ~84Gi,
+#   combined ~54 CPU / ~174Gi against the node's 72 CPU / 252Gi allocatable — leaves real
+#   headroom for the ~30 native Docker containers (measured ~41Gi actual usage
+#   2026-08-20) plus k3s/containerd overhead. Requests are far more conservative (this
+#   pool's 30 x 250m = 7.5 CPU requested at full scale-out) so the scheduler admits
+#   everything comfortably; the limits above are a burst ceiling, not a capacity plan.
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: arc-ergonlabs-k8s-small
+  namespace: kube-system
+spec:
+  chart: oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+  version: "0.14.2"
+  targetNamespace: arc-runners
+  createNamespace: false
+  valuesContent: |-
+    githubConfigUrl: https://github.com/ergonlabs
+    githubConfigSecret: arc-github-app
+    runnerScaleSetName: ergonlabs-k8s-small
+
+    minRunners: 0
+    maxRunners: 30
+
+    template:
+      spec:
+        # Same reasoning as 20-scale-set.yaml: avoids the in-cluster-namespace
+        # footgun for any job that ever runs kubectl against its own service
+        # account. These jobs don't call kubectl today, but there's no reason to
+        # carry the risk when the fix costs nothing.
+        automountServiceAccountToken: false
+
+        containers:
+          - name: runner
+            # Same custom image as the large pool (see runner-image/Dockerfile) —
+            # NOT a stripped-down variant. Reusing it means one image to build and
+            # keep in sync, and it's what carries the Runner.Worker.dll patch that
+            # redirects actions/cache at our in-cluster server (below), which is
+            # the main speed win for this pool's pnpm-store-heavy jobs. The extra
+            # baked tools (Go, Tilt, Playwright, k8s toolchain) this pool never
+            # uses cost nothing at runtime beyond image size, and the image is
+            # already cached in the local registry.
+            image: localhost:5001/ergonlabs/actions-runner:2026-08-14b
+            command: ["/home/runner/run.sh"]
+            env:
+              - name: POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+              # No DOCKER_HOST / RUNNER_WAIT_FOR_DOCKER_IN_SECONDS / BUILDKIT_HOST /
+              # DOCKER_IO_MIRROR_ENDPOINT here — deliberately. This pool's jobs
+              # never invoke Docker (confirmed: no dind/buildkitd sidecar exists
+              # in this pod spec at all), so there is nothing for those to point at.
+              #
+              # Redirect actions/cache at the in-cluster cache server, same as the
+              # large pool — trailing slash required, ACTIONS_CACHE_URL
+              # deliberately not set (legacy v1, unimplemented). See
+              # 20-scale-set.yaml's runner container for the full explanation;
+              # unchanged here.
+              - name: ACTIONS_RESULTS_URL
+                value: http://arc-cache.arc-runners.svc.cluster.local:3000/
+            resources:
+              requests:
+                cpu: 250m
+                memory: 768Mi
+              limits:
+                cpu: "1"
+                memory: 3Gi
+            volumeMounts:
+              - name: work
+                mountPath: /home/runner/_work
+                subPathExpr: $(POD_NAME)
+
+        volumes:
+          # Same LUN-backed work volume as the large pool (20-scale-set.yaml) —
+          # subPathExpr keys on POD_NAME, so both pools sharing one hostPath is
+          # safe (no name collisions across pools; pod names are cluster-unique).
+          # Reusing it means 30-store-gc.yaml's existing sweep covers this pool's
+          # workspaces with no changes needed — pod names here are
+          # ergonlabs-k8s-small-*, which still matches the GC script's
+          # ergonlabs-k8s-* glob.
+          - name: work
+            hostPath:
+              path: /mnt/arc-block/work
+              type: Directory

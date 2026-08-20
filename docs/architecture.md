@@ -25,7 +25,18 @@ GitHub (org: ergonlabs)
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
-## Runner pod
+## Two pools
+
+The diagram and "Runner pod" section below describe the **large pool** (`ergonlabs-k8s`,
+`manifests/20-scale-set.yaml`) — full dind + buildkitd, for jobs that build Docker images or
+run kind. Since 2026-08-20 there's also a **small pool** (`ergonlabs-k8s-small`,
+`manifests/21-scale-set-small.yaml`): a single `runner` container, no Docker at all, for jobs
+that never touch it (lint/typecheck/test/build). Both pools share the same custom runner image,
+`arc-cache`, `arc-hub-mirror`, and `arc-store-gc`; the small pool's runner pods just don't mount
+the dind/buildkit volumes or set the Docker-related env vars, so there's nothing extra to
+diagram for it. See `21-scale-set-small.yaml`'s own comments for the full rationale.
+
+## Runner pod (large pool)
 
 Four containers, all from `manifests/20-scale-set.yaml`:
 
@@ -109,12 +120,27 @@ Deliberately excluded, though `ubuntu-latest` has them: `minikube`, `podman`, `b
 
 ## Sizing
 
-Each job requests ~3 CPU / 6Gi (runner 2/4Gi + dind 0.5/1Gi + buildkit 0.5/1Gi).
-`maxRunners: 12` ⇒ 36 CPU / 72Gi on the reference 72-core / 252Gi node, leaving about half the
-box for other workloads. `minRunners: 0` so idle CI costs nothing.
+Both pools have real CPU **limits** now (added 2026-08-20 — before that only memory was
+capped), not just requests, so a runaway job in either pool throttles instead of starving its
+neighbors.
 
-Storage per job is roughly 1 GB (595 MB externals + checkout + restored caches), reclaimed by
-the GC within 15 minutes.
+**Large pool** (`ergonlabs-k8s`): each job requests ~3 CPU / 6Gi (runner 2/4Gi + dind 0.5/1Gi +
+buildkit 0.5/1Gi), limits ~8 CPU / 28Gi. `maxRunners: 3` ⇒ worst-case ceiling ~24 CPU / ~84Gi.
+
+**Small pool** (`ergonlabs-k8s-small`): each job requests 250m CPU / 768Mi, limits 1 CPU / 3Gi.
+`maxRunners: 30` ⇒ worst-case ceiling ~30 CPU / ~90Gi.
+
+Combined worst-case ceiling (~54 CPU / ~174Gi) leaves real headroom on the reference 72-core /
+252Gi node for the ~30 native Docker containers (measured ~41Gi actual usage 2026-08-20) plus
+k3s/containerd overhead — and that ceiling only bites in the pathological all-pods-bursting-
+simultaneously case, not steady state, since requests for both pools combined at full scale-out
+are only ~16.5 CPU. `minRunners: 0` on both, so idle CI costs nothing.
+
+Storage per job is roughly 1 GB in the large pool (595 MB externals + checkout + restored
+caches), much less in the small pool (no dind/buildkit stores at all — just checkout + node
+caches). `arc-store-gc` sweeps every 5 minutes, backed by `arc-store-gc-pressure` (a reactive
+watcher added 2026-08-20 that triggers an out-of-cycle sweep the moment disk usage crosses 90%,
+for bursts faster than any fixed interval can react to).
 
 ## Security posture
 
