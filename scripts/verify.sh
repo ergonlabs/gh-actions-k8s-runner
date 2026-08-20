@@ -52,6 +52,9 @@ done
 INST=$(cat /proc/sys/fs/inotify/max_user_instances 2>/dev/null || echo 0)
 [ "$INST" -ge 512 ] && ok "fs.inotify.max_user_instances = $INST" \
   || bad "fs.inotify.max_user_instances = $INST (need >=512; kind will fail)"
+AIO=$(cat /proc/sys/fs/aio-max-nr 2>/dev/null || echo 0)
+[ "$AIO" -ge 1048576 ] && ok "fs.aio-max-nr = $AIO" \
+  || bad "fs.aio-max-nr = $AIO (need >=1048576; Kafka/Redpanda will crash-loop under concurrent E2E load)"
 grep -q "$ARC_BLOCK_MOUNT" /etc/fstab 2>/dev/null \
   && ok "block device in fstab (survives reboot)" || bad "no fstab entry — mount is not persistent"
 

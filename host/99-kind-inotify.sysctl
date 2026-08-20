@@ -19,9 +19,21 @@
 #
 # These are small kernel objects; raising the ceiling costs essentially nothing.
 #
-# If you install this, ~/k8s/arc/50-node-tuning.yaml (the DaemonSet that applies
-# the same values from inside k3s) becomes redundant and can be deleted.
+# fs.aio-max-nr, added 2026-08-20: Kafka/Redpanda pods inside concurrent kind
+# clusters need a larger AIO context budget than the 65536 default, or they
+# crash-loop under ~4+ overlapping E2E cluster bring-ups with "Could not
+# setup Async I/O ... exceeds the capacity in /proc/sys/fs/aio-max-nr 65536".
+# This is a genuinely non-namespaced, host-wide kernel resource — a container
+# cannot raise it for itself even as root, confirmed by reproducing
+# sugarmaple-app's own (silently non-functional) in-CI attempt: an
+# unprivileged pod's /proc/sys is read-only, so `sysctl -w` there no-ops
+# while still printing the target value and exiting 0.
+#
+# If you install this, ~/arc-infra/manifests/50-node-tuning.yaml (the
+# DaemonSet that applies the same values from inside k3s) becomes redundant
+# and can be deleted.
 
 fs.inotify.max_user_instances = 8192
 fs.inotify.max_user_watches = 1048576
 fs.inotify.max_queued_events = 65536
+fs.aio-max-nr = 1048576

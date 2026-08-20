@@ -1,6 +1,6 @@
 # Node sysctl tuning for kind-in-CI.
 #
-# WHY
+# WHY (inotify)
 #   sugarmaple-app's "E2E Tests" job creates a kind cluster inside the runner
 #   pod's dind sidecar and deploys the full app stack with Tilt. On 2026-08-13 it
 #   failed with the classic kind-in-CI error:
@@ -23,12 +23,34 @@
 #   A single kind cluster running the full app stack exhausts that by itself.
 #   8192 is generous but these are tiny kernel objects; the cost is negligible.
 #
+# WHY (aio-max-nr)
+#   Added 2026-08-20 after a real incident (sugarmaple-app run 32169727780):
+#   Kafka/Redpanda pods inside concurrent kind clusters crash-looped with
+#   "Could not setup Async I/O ... exceeds the capacity in
+#   /proc/sys/fs/aio-max-nr 65536" whenever ~4 E2E cluster bring-ups (two PRs +
+#   a main push + one more branch) overlapped and all fought over the same
+#   65536 host-wide budget. sugarmaple-app's own kind-cluster-bootstrap action
+#   already had a step meant to raise this via `sudo sysctl -w
+#   fs.aio-max-nr=1048576` INSIDE the runner container — it never worked.
+#   Reproduced directly: the runner container's /proc/sys is mounted
+#   read-only (normal for an unprivileged container, no sandboxing involved),
+#   so the write silently no-ops — but `sysctl -w` echoes the target value and
+#   exits 0 even on that specific failure ("ignoring: Read-only file system"
+#   goes to stderr, easy to miss in CI logs), which is why it looked like it
+#   was working. Confirmed the fix belongs here instead: a write from the
+#   privileged `dind` sidecar succeeded and was visible on the HOST's own
+#   /proc/sys/fs/aio-max-nr — this is a genuinely non-namespaced, host-wide
+#   kernel resource, same class as fs.inotify.* below.
+#
 # WHY A DAEMONSET
-#   fs.inotify.* sysctls are NOT namespaced, so a pod cannot set them for itself
-#   via securityContext.sysctls — kubelet rejects non-namespaced sysctls. They
-#   must be set on the host. A DaemonSet with a privileged init container is the
-#   standard pattern (same shape as elasticsearch's vm.max_map_count tuner) and,
-#   unlike a one-off `sysctl -w`, it re-applies automatically after a reboot.
+#   These sysctls are NOT namespaced, so a pod cannot set them for itself
+#   via securityContext.sysctls — kubelet rejects non-namespaced sysctls, and
+#   (per the aio-max-nr incident above) an unprivileged container's /proc/sys
+#   is read-only regardless of in-container user privilege. They must be set
+#   by something with real host-level privilege. A DaemonSet with a privileged
+#   init container is the standard pattern (same shape as elasticsearch's
+#   vm.max_map_count tuner) and, unlike a one-off `sysctl -w`, it re-applies
+#   automatically after a reboot.
 #
 #   A plain /etc/sysctl.d/ drop-in would be tidier, but writing there needs root
 #   and sudo is password-gated on this box. `99-kind-inotify.sysctl` in this
@@ -69,6 +91,11 @@ spec:
               # kind also benefits from a deeper event queue under load
               sysctl -w fs.inotify.max_queued_events=65536
               sysctl -n fs.inotify.max_user_instances
+              # Kafka/Redpanda's AIO context budget — see WHY (aio-max-nr) above.
+              # 1048576 (16x the 65536 default) matches what sugarmaple-app's own
+              # (non-functional) CI-side attempt was already targeting.
+              sysctl -w fs.aio-max-nr=1048576
+              sysctl -n fs.aio-max-nr
       containers:
         # Nothing to do once the sysctls are set; just stay Running so the
         # DaemonSet is visibly healthy and re-runs its init on reboot.
