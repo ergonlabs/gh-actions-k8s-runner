@@ -41,6 +41,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# GitHub CLI. Hosted ubuntu-latest ships it by default; this image didn't, so
+# sugarmaple-app's "cancel the run on gate failure" fail-fast step (`gh run
+# cancel ...`, used across ci.yml to stop e2e-tests early when any gate job
+# fails) silently no-op'd with "gh: command not found" instead of failing
+# fast — found 2026-08-21 via apps/admin gate job 96835226815.
+RUN set -eux; \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      | gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg; \
+    chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg; \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends gh; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*; \
+    gh --version
+
 # ---------------------------------------------------------------------------
 # Kubernetes toolchain.
 #

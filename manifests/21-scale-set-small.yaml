@@ -118,7 +118,7 @@ spec:
             # baked tools (Go, Tilt, Playwright, k8s toolchain) this pool never
             # uses cost nothing at runtime beyond image size, and the image is
             # already cached in the local registry.
-            image: localhost:5001/ergonlabs/actions-runner:2026-08-14b
+            image: localhost:5001/ergonlabs/actions-runner:2026-08-21
             command: ["/home/runner/run.sh"]
             env:
               - name: POD_NAME
