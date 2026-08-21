@@ -82,6 +82,20 @@
 #   (25-35% utilized) while CPU usage sat at ~100% of its limit — these jobs
 #   are CPU-bound, not memory-bound, so the memory ceiling is a soft cap in
 #   practice, unlike the CPU one.
+#
+#   Per-pod memory limit raised 3Gi -> 4Gi on 2026-08-21, after
+#   `packages/eslint-plugin - gates` OOMKilled 4 separate pods the same day
+#   (exit 137 each time, ~20 min into the job) — type-aware ESLint on that
+#   workspace is a real, repeatable exception to the "memory is a soft cap"
+#   finding above, not a fluke. Applied in a genuinely idle window (25/50
+#   runners, node at 49% mem / 14% CPU — well below the ~48-pod busy state
+#   that deferred this fix on the first three occurrences). 50 x 4Gi = 200Gi
+#   still comfortably fits the node's 251Gi total alongside the large pool's
+#   worst-case ~84Gi and native baseline, since actual simultaneous usage
+#   across pools has never come close to worst-case-sum (see CPU note above
+#   for the same reasoning applied to that resource). Requests unchanged at
+#   768Mi — this only raises the OOM ceiling, it doesn't change scheduling
+#   admission math.
 apiVersion: helm.cattle.io/v1
 kind: HelmChart
 metadata:
@@ -143,7 +157,7 @@ spec:
                 memory: 768Mi
               limits:
                 cpu: "1"
-                memory: 3Gi
+                memory: 4Gi
             volumeMounts:
               - name: work
                 mountPath: /home/runner/_work
