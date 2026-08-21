@@ -77,7 +77,16 @@ spec:
         # `docker buildx build --cache-to type=gha` calls with connection
         # refused. Node has 72 cores, so headroom isn't the constraint — fair
         # scheduling share is.
-        cpu: 1000m
+        #
+        # Recurred 2026-08-21 right after the small pool's maxRunners went
+        # 30->50: a burst of ~15-20 pods scheduled within a 4-min window
+        # overwhelmed even the 1000m share, and the *liveness* probe (5s
+        # timeout, 5 failures = 50s grace) killed the pod mid-storm — the
+        # restart, not just the slowdown, is what broke an in-flight cache
+        # push (E2E job on run 32502436472). Bumped again + probes loosened
+        # so transient contention degrades response time instead of causing
+        # a kill-and-restart cycle, which is strictly worse.
+        cpu: 2000m
         memory: 512Mi
       limits:
         memory: 4Gi
@@ -86,17 +95,17 @@ spec:
       httpGet:
         path: /health
         port: cache
-      timeoutSeconds: 5
+      timeoutSeconds: 10
       periodSeconds: 10
-      failureThreshold: 5
+      failureThreshold: 9
 
     readinessProbe:
       httpGet:
         path: /health
         port: cache
-      timeoutSeconds: 5
+      timeoutSeconds: 8
       periodSeconds: 10
-      failureThreshold: 3
+      failureThreshold: 5
 
     service:
       type: ClusterIP
