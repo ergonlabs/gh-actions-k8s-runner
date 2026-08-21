@@ -63,18 +63,36 @@
 #     workloads (Immich ML, Frigate NVR, etc.) haven't been stress-tested for
 #     their own CPU peaks.
 #
-#   50 max here (unchanged 1 CPU / 3Gi limit per pod) + 3 max in
-#   20-scale-set.yaml's pool. Real/worst-case ceiling for THIS pool is ~50
-#   CPU (see above — treat this as real usage, not a soft cap) + large
-#   pool's ~24 CPU ceiling (soft — its historical usage has been
-#   memory-bound, not CPU-bound, so hitting both ceilings simultaneously is
-#   unlikely though not impossible) + ~2 CPU native baseline with margin —
-#   close to but should stay under the node's 72 CPU total. Does NOT fully
-#   cover two full-workspace runs overlapping (that needs up to 88 slots);
-#   50 reduces cross-run contention without eliminating it. Requests stay
-#   conservative (50 x 250m = 12.5 CPU requested at full scale-out) so the
-#   scheduler always admits everything; it's the LIMIT math above that's the
-#   real constraint for this pool now.
+#   50 max here (1 CPU / 3Gi limit per pod) + 3 max in 20-scale-set.yaml's
+#   pool. Real/worst-case ceiling for THIS pool is ~50 CPU (see above —
+#   treat this as real usage, not a soft cap) + large pool's ~24 CPU
+#   ceiling (soft — its historical usage has been memory-bound, not
+#   CPU-bound, so hitting both ceilings simultaneously is unlikely though
+#   not impossible) + ~2 CPU native baseline with margin — close to but
+#   should stay under the node's 72 CPU total. Does NOT fully cover two
+#   full-workspace runs overlapping (that needs up to 88 slots); 50 reduces
+#   cross-run contention without eliminating it. Requests stay conservative
+#   (50 x 250m = 12.5 CPU requested at full scale-out) so the scheduler
+#   always admits everything; it's the LIMIT math above that's the real
+#   constraint for this pool now.
+#
+#   Changed 2026-08-21 (owner decision, explicit trade-off): maxRunners
+#   50 -> 30, per-pod CPU limit 1 -> 2. Worth being precise about what this
+#   actually does to the ceiling math above, since "raise the limit, lower
+#   the count" does NOT net out to a lower worst-case the way it might
+#   sound: 30 x 2 CPU = 60 CPU real ceiling for this pool alone, HIGHER
+#   than the previous 50 x 1 CPU = 50 CPU. Combined system worst-case goes
+#   from ~76 CPU (50+24+2) to ~86 CPU (60+24+2), both against a 72 CPU
+#   node — this change does not reduce the peak-contention risk by raw
+#   ceiling math, it increases it. Made anyway as a deliberate,
+#   owner-acknowledged trade against a different axis: fewer, less-
+#   throttled pods finish each individual job faster (relieves the
+#   ~100%-of-1-CPU-limit throttling measured above), which may shorten the
+#   real overlap window even though the instantaneous ceiling is nominally
+#   higher — time-integrated contention isn't the same thing as peak
+#   ceiling, and this hasn't been measured yet against real burst traffic.
+#   Requests still conservative (30 x 250m = 7.5 CPU at full scale-out), so
+#   scheduler admission isn't the concern here, same as before.
 #
 #   Memory is NOT symmetric with CPU here — don't read the 50 x 3Gi = 150Gi
 #   limit-sum as equally real risk. During the same 44-job burst, real
@@ -112,7 +130,7 @@ spec:
     runnerScaleSetName: ergonlabs-k8s-small
 
     minRunners: 0
-    maxRunners: 50
+    maxRunners: 30
 
     template:
       spec:
@@ -156,7 +174,7 @@ spec:
                 cpu: 250m
                 memory: 768Mi
               limits:
-                cpu: "1"
+                cpu: "2"
                 memory: 4Gi
             volumeMounts:
               - name: work
