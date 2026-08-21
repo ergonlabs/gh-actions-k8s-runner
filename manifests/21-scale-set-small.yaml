@@ -30,14 +30,58 @@
 #   jobs run concurrently with the E2E job anyway, so they have buffer.
 #
 # SIZING
-#   30 max here + 3 max in 20-scale-set.yaml's pool. Worst-case resource ceiling (all
-#   containers in all pods hitting their LIMIT simultaneously, the true pathological
-#   case, not steady state): this pool ~30 CPU / ~90Gi, the large pool ~24 CPU / ~84Gi,
-#   combined ~54 CPU / ~174Gi against the node's 72 CPU / 252Gi allocatable — leaves real
-#   headroom for the ~30 native Docker containers (measured ~41Gi actual usage
-#   2026-08-20) plus k3s/containerd overhead. Requests are far more conservative (this
-#   pool's 30 x 250m = 7.5 CPU requested at full scale-out) so the scheduler admits
-#   everything comfortably; the limits above are a burst ceiling, not a capacity plan.
+#   Raised 30 -> 50 on 2026-08-21, after the FIRST real run against this pool
+#   (sugarmaple-app PR #183, which touches .github/ and so triggers every
+#   workspace via gate-affected.sh's "changed under .github/ -> gate
+#   everything" rule) supplied real measurements instead of the original
+#   speculative ones:
+#
+#   - The run needed exactly 44 concurrent slots (43 TS/JS workspaces + 1 Go
+#     job — the real ceiling, not a guess). At maxRunners=30, 14 jobs queued;
+#     2 of them (packages/kafka, tools/mcp-client) waited an extra ~4.5-5 min
+#     for a slot. Not a blocker (all 44 finished well before e2e-tests, which
+#     is the actual critical path), but real, measurable queueing.
+#   - Every pod's ACTUAL CPU usage sat at essentially the full 1-CPU limit —
+#     these jobs (tsc, eslint, vitest, vite) are genuinely CPU-bound, not the
+#     ~0.1 CPU/job assumed in the original sizing note below (that number was
+#     measured for a different job type). This means the LIMIT is a real
+#     usage ceiling for this pool, not a rarely-hit burst cap the way it is
+#     for the large pool — raising maxRunners scales real simultaneous usage
+#     close to linearly, NOT just a theoretical worst case. Do not also raise
+#     the per-pod CPU limit without redoing this math: 50 pods x 2 CPU would
+#     be a 100 CPU ceiling alone, over the whole node's capacity before
+#     counting anything else. That mistake was caught and corrected before
+#     shipping — see arc-runner-sizing-decision memory for the full exchange.
+#   - Node CPU floor was also re-measured properly for the first time: idle
+#     (pool empty) the node uses ~2.6 CPU total, of which ~0.65 CPU is k8s
+#     pods — so native Docker + k3s/containerd overhead is only ~2 CPU, NOT
+#     "half the box" as originally assumed. During the 44-job burst (31 pods
+#     running) the node sat at 44% (~32 CPU), consistent with that same ~2
+#     CPU native baseline plus ~30 CPU of real small-pool usage. Still
+#     reserving a generous safety margin above that ~2 CPU floor here rather
+#     than spending the newfound headroom in one place, since native
+#     workloads (Immich ML, Frigate NVR, etc.) haven't been stress-tested for
+#     their own CPU peaks.
+#
+#   50 max here (unchanged 1 CPU / 3Gi limit per pod) + 3 max in
+#   20-scale-set.yaml's pool. Real/worst-case ceiling for THIS pool is ~50
+#   CPU (see above — treat this as real usage, not a soft cap) + large
+#   pool's ~24 CPU ceiling (soft — its historical usage has been
+#   memory-bound, not CPU-bound, so hitting both ceilings simultaneously is
+#   unlikely though not impossible) + ~2 CPU native baseline with margin —
+#   close to but should stay under the node's 72 CPU total. Does NOT fully
+#   cover two full-workspace runs overlapping (that needs up to 88 slots);
+#   50 reduces cross-run contention without eliminating it. Requests stay
+#   conservative (50 x 250m = 12.5 CPU requested at full scale-out) so the
+#   scheduler always admits everything; it's the LIMIT math above that's the
+#   real constraint for this pool now.
+#
+#   Memory is NOT symmetric with CPU here — don't read the 50 x 3Gi = 150Gi
+#   limit-sum as equally real risk. During the same 44-job burst, real
+#   per-pod memory usage measured ~700Mi-1.1Gi against the 3Gi limit
+#   (25-35% utilized) while CPU usage sat at ~100% of its limit — these jobs
+#   are CPU-bound, not memory-bound, so the memory ceiling is a soft cap in
+#   practice, unlike the CPU one.
 apiVersion: helm.cattle.io/v1
 kind: HelmChart
 metadata:
@@ -54,7 +98,7 @@ spec:
     runnerScaleSetName: ergonlabs-k8s-small
 
     minRunners: 0
-    maxRunners: 30
+    maxRunners: 50
 
     template:
       spec:

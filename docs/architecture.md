@@ -128,13 +128,33 @@ neighbors.
 buildkit 0.5/1Gi), limits ~8 CPU / 28Gi. `maxRunners: 3` ⇒ worst-case ceiling ~24 CPU / ~84Gi.
 
 **Small pool** (`ergonlabs-k8s-small`): each job requests 250m CPU / 768Mi, limits 1 CPU / 3Gi.
-`maxRunners: 30` ⇒ worst-case ceiling ~30 CPU / ~90Gi.
+`maxRunners: 50` (raised from 30 on 2026-08-21 — see below) ⇒ ceiling ~50 CPU / ~150Gi.
 
-Combined worst-case ceiling (~54 CPU / ~174Gi) leaves real headroom on the reference 72-core /
-252Gi node for the ~30 native Docker containers (measured ~41Gi actual usage 2026-08-20) plus
-k3s/containerd overhead — and that ceiling only bites in the pathological all-pods-bursting-
-simultaneously case, not steady state, since requests for both pools combined at full scale-out
-are only ~16.5 CPU. `minRunners: 0` on both, so idle CI costs nothing.
+**Important asymmetry, found 2026-08-21 from the first real run against this pool:** the small
+pool's CPU limit is REAL usage, not a rarely-hit burst cap the way it is for the large pool —
+every pod's actual CPU usage sat at the full 1-CPU limit under load (tsc/eslint/vitest/vite are
+genuinely CPU-bound), so raising `maxRunners` scales real simultaneous usage close to linearly.
+The large pool's historical usage has been memory-bound, not CPU-bound, so its limits stay a
+soft ceiling. **Do not raise the small pool's per-pod CPU limit without redoing this math** —
+50 pods × 2 CPU alone would exceed the whole node's 72-CPU capacity.
+
+CPU and memory risk are NOT symmetric here, and shouldn't be read as one combined number:
+
+- **CPU**: real risk. Combined ceiling ~74 CPU (~50 real for the small pool + ~24 soft for the
+  large pool) is close to the node's 72-CPU capacity. Native Docker + k3s overhead was properly
+  measured for the first time on 2026-08-21: only ~2 CPU at idle (not "half the box" as
+  originally assumed) — the margin above that floor is a safety reserve against native workload
+  spikes (Immich ML, Frigate NVR, etc.) that haven't been stress-tested, not slack to spend on
+  more runner capacity.
+- **Memory**: soft ceiling, not real risk. Combined limit-sum is ~234Gi against 252Gi
+  allocatable, which looks tight on paper, but real per-pod usage in the small pool measured
+  ~700Mi-1.1Gi against its 3Gi limit (25-35% utilized) during the same 44-job burst where CPU
+  usage sat at ~100% of its limit — these jobs are CPU-bound, not memory-bound, so the 150Gi
+  small-pool memory ceiling is very unlikely to be approached in practice the way the CPU
+  ceiling is.
+
+`minRunners: 0` on both, so idle CI costs nothing. See `21-scale-set-small.yaml`'s own SIZING
+comment for the full real-run numbers this is based on.
 
 Storage per job is roughly 1 GB in the large pool (595 MB externals + checkout + restored
 caches), much less in the small pool (no dind/buildkit stores at all — just checkout + node
