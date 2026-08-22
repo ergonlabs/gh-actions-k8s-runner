@@ -114,6 +114,25 @@
 #   for the same reasoning applied to that resource). Requests unchanged at
 #   768Mi — this only raises the OOM ceiling, it doesn't change scheduling
 #   admission math.
+#
+#   Changed 2026-08-22 (owner decision): maxRunners 30 -> 20, CPU limit
+#   unchanged at 2. Driven by tracing the sugarmaple-app E2E "doppler
+#   leader-election lost" flake (see arc-e2e-doppler-leader-election-timeout
+#   memory) to cross-run node contention: with the 2026-08-21 sizing, the
+#   node's worst-case CPU ceiling was baseline(~3.3) + large pool(3x8=24) +
+#   small pool(30x2=60) = ~87.3 CPU against 72 real CPUs — 15.3 CPU over
+#   capacity if both pools ever filled up at once, corroborated live (an
+#   isolated rerun of a previously-failed E2E job passed clean with the pool
+#   otherwise idle). Dropping to 20 runners brings the small pool's
+#   contribution to 40, total ceiling to ~67.3 — about 4.7 CPU of buffer
+#   instead of running over. Explicitly a suboptimal trade (fewer concurrent
+#   small-pool slots than the historically-measured 44-job need, so expect
+#   some queuing on `.github/`-triggered "gate everything" runs — see the
+#   2026-08-21 note above for what that queuing looked like at maxRunners=30
+#   under load) made deliberately in favor of not starving the shared node.
+#   Revisit if sugarmaple-app's workspace count drops (fewer, larger
+#   packages would need fewer concurrent small-pool slots and could let this
+#   come back up) or if the doppler-flake theory gets disproven.
 apiVersion: helm.cattle.io/v1
 kind: HelmChart
 metadata:
@@ -130,7 +149,7 @@ spec:
     runnerScaleSetName: ergonlabs-k8s-small
 
     minRunners: 0
-    maxRunners: 30
+    maxRunners: 20
 
     template:
       spec:
