@@ -228,15 +228,41 @@ spec:
               # the pod's true peak is max(buildkitd, dind+runner) across the two
               # phases, not sum(all three limits).
               #
-              # Raised 4 -> 6 same day (owner decision): still hadn't re-measured
-              # whether 4 fully cleared the throttling (only know 2 wasn't enough),
-              # so this is a deliberate buffer rather than a re-measured number.
-              # Same reasoning as the 2->4 bump still holds at 6 — it now sits
-              # exactly at dind(2)+runner(4)=6, i.e. the pod's real peak still
-              # doesn't move; only above 6 would the flat sum-of-limits ceiling
-              # used for cross-*pod*/cross-run sizing actually start to grow.
+              # Raised 4 -> 6, then back down to 4, same day (2026-08-23).
+              #
+              # The "doesn't add to the ceiling" reasoning above was WRONG — it only
+              # checked within-pod phase separation (buildkitd idle once dind+runner
+              # are busy) and never redid the cross-*pod* math. With maxRunners: 3,
+              # nothing stops 3 pods from all being in their build phase
+              # simultaneously (three E2E jobs starting around the same time is
+              # normal, not a corner case) — at that point buildkitd's limit DOES
+              # multiply straight into the cluster-wide ceiling: 3 x 6 = 18 CPU from
+              # buildkitd alone. Combined with small-pool's ceiling at the time
+              # (20 x 2 = 40), that put worst-case at ~79 CPU against 72 real cores.
+              # All 3 same-day "unexpected EOF" nested-kind image-pull failures
+              # landed after the 2->4->6 raise, none before — see
+              # arc-e2e-pgvector-pull-eof memory for the full timeline. A peer
+              # session's stopgap (dropping small-pool maxRunners 20->14, commit
+              # c2bfda8) didn't fully clear it either (a 4th EOF occurrence and a
+              # Doppler-leader-election-timeout recurrence both landed after that
+              # fix too) — this reduction is the other half of correcting the
+              # actual mistake instead of continuing to compensate for it elsewhere.
+              #
+              # At 4: per-pod sum is runner(4)+dind(2)+buildkitd(4)=10, cluster
+              # ceiling 3x10=30 + small(14x2=28) + baseline(~3) = ~61 CPU against 72
+              # — an ~11 CPU buffer, the healthiest this file has had all day. Still
+              # keeps the real, cgroup-measured throttling fix (2 was genuinely
+              # insufficient, confirmed via cpu.stat) — this isn't a full revert.
+              #
+              # If buildkitd throttles again at 4: don't just raise the number again
+              # without redoing this math. The owner's suggested next lever is
+              # smarter build caching (not every PR touches every one of the
+              # ~15-20 service images Tilt builds during bootstrap — a persistent
+              # cross-run buildkit cache, beyond the existing per-service
+              # --cache-from/--cache-to type=gha scope, could cut how much
+              # concurrent compute bootstrap actually needs) rather than more CPU.
               limits:
-                cpu: "6"
+                cpu: "4"
                 memory: 8Gi
             volumeMounts:
               - name: buildkit-sock
