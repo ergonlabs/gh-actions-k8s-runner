@@ -226,12 +226,17 @@ spec:
               # cluster is up and tests are running — the phase where dind+runner do
               # their own work. The three containers' peaks don't overlap in time, so
               # the pod's true peak is max(buildkitd, dind+runner) across the two
-              # phases, not sum(all three limits) — 4 is still under dind(2)+runner(4)
-              # = 6, so this doesn't move the pod's actual peak at all, only relieves
-              # a bottleneck that was real but budgeted as if it were concurrent with
-              # load it never actually overlaps.
+              # phases, not sum(all three limits).
+              #
+              # Raised 4 -> 6 same day (owner decision): still hadn't re-measured
+              # whether 4 fully cleared the throttling (only know 2 wasn't enough),
+              # so this is a deliberate buffer rather than a re-measured number.
+              # Same reasoning as the 2->4 bump still holds at 6 — it now sits
+              # exactly at dind(2)+runner(4)=6, i.e. the pod's real peak still
+              # doesn't move; only above 6 would the flat sum-of-limits ceiling
+              # used for cross-*pod*/cross-run sizing actually start to grow.
               limits:
-                cpu: "4"
+                cpu: "6"
                 memory: 8Gi
             volumeMounts:
               - name: buildkit-sock
