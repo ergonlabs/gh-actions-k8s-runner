@@ -208,8 +208,30 @@ spec:
                 cpu: 500m
                 memory: 1Gi
               # CPU limit added 2026-08-20 — see the dind container above for why.
+              # Raised 2 -> 4 on 2026-08-23: measured live via cgroup cpu.stat on two
+              # concurrently-running E2E pods during a bootstrap-phase CPU-throttling
+              # investigation — buildkitd was throttled ~33-35% of all CPU periods,
+              # accumulating 65-66 *minutes* of throttled time each in pods only
+              # ~25-35 min old, while dind and runner in the same pods sat at ~1-2%
+              # throttled. Tilt builds ~15-20 service images concurrently during
+              # bootstrap, each running real compute (tsc, etc.) inside buildkitd via
+              # the remote buildx driver — 2 CPU was never enough for that fan-out.
+              # Plausibly also explains the unexplained "search-service tsc silently
+              # died mid-build" flake from 2026-08-22 (previously guessed as OOM;
+              # starvation-induced timeout is at least as likely given this evidence).
+              #
+              # Raising this does NOT add to the pod's real worst-case CPU ceiling:
+              # buildkitd is only active during the bootstrap/build phase, and is
+              # idle (low single-digit millicores, confirmed live) once the kind
+              # cluster is up and tests are running — the phase where dind+runner do
+              # their own work. The three containers' peaks don't overlap in time, so
+              # the pod's true peak is max(buildkitd, dind+runner) across the two
+              # phases, not sum(all three limits) — 4 is still under dind(2)+runner(4)
+              # = 6, so this doesn't move the pod's actual peak at all, only relieves
+              # a bottleneck that was real but budgeted as if it were concurrent with
+              # load it never actually overlaps.
               limits:
-                cpu: "2"
+                cpu: "4"
                 memory: 8Gi
             volumeMounts:
               - name: buildkit-sock
