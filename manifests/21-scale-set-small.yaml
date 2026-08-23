@@ -210,6 +210,30 @@ spec:
               # unchanged here.
               - name: ACTIONS_RESULTS_URL
                 value: http://arc-cache.arc-runners.svc.cluster.local:3000/
+              # Shared pnpm content-addressable store, 2026-08-23 (owner-directed
+              # disk-space hardening). Before this, each job's `pnpm install`
+              # populated its OWN store at <workspace>/.pnpm-store — confirmed live
+              # via `du`, ~1.4-1.9GB per pod, every single time, even for packages
+              # every other concurrent job was ALSO downloading. That's the single
+              # biggest contributor to /mnt/arc-block/work's footprint (144G of the
+              # LUN's 251G in one snapshot) and directly fed today's ENOSPC bursts.
+              #
+              # pnpm's store is explicitly designed for concurrent multi-process
+              # sharing (content-addressable, hardlinked into each project's
+              # node_modules, atomic per-file writes) — this is pnpm's own
+              # documented use case, not a repurposing. Pointing every small-pool
+              # pod at the SAME persistent path instead of a private one means
+              # packages get fetched once, ever, and every subsequent job across
+              # every PR just hardlinks from what's already there — smaller
+              # per-job footprint AND faster installs, not a tradeoff between them.
+              #
+              # npm_config_store_dir (lowercase, npm/pnpm's config-to-env-var
+              # convention: store-dir -> npm_config_store_dir) beats a
+              # project-committed .npmrc in pnpm's own config precedence, so this
+              # overrides whatever the repo's own store-dir setting is without
+              # needing an app-side change.
+              - name: npm_config_store_dir
+                value: /mnt/pnpm-store
             resources:
               requests:
                 cpu: 250m
@@ -221,6 +245,8 @@ spec:
               - name: work
                 mountPath: /home/runner/_work
                 subPathExpr: $(POD_NAME)
+              - name: pnpm-store
+                mountPath: /mnt/pnpm-store
 
         volumes:
           # Same LUN-backed work volume as the large pool (20-scale-set.yaml) —
@@ -233,4 +259,15 @@ spec:
           - name: work
             hostPath:
               path: /mnt/arc-block/work
+              type: Directory
+          # Deliberately NOT subPathExpr'd — the whole point is every pod sharing
+          # ONE store, same pattern as 45-hub-mirror.yaml's mirror cache. Directory
+          # pre-created with mode 1777 (world-writable + sticky, like /tmp) so any
+          # runner UID can write safely regardless of which pod touches it first.
+          # type: Directory (not DirectoryOrCreate), matching this repo's
+          # fail-loud convention — pods fail to schedule rather than silently
+          # writing to the root filesystem if the LUN isn't mounted.
+          - name: pnpm-store
+            hostPath:
+              path: /mnt/arc-block/pnpm-store
               type: Directory
