@@ -133,6 +133,28 @@
 #   Revisit if sugarmaple-app's workspace count drops (fewer, larger
 #   packages would need fewer concurrent small-pool slots and could let this
 #   come back up) or if the doppler-flake theory gets disproven.
+#
+#   Changed 2026-08-23 (unattended, pre-authorized by the 3rd-occurrence note
+#   in memory arc-e2e-pgvector-pull-eof): maxRunners 20 -> 14. The large
+#   pool's buildkitd CPU limit was raised 2 -> 4 -> 6 earlier the same day
+#   (01:48/01:51 UTC, commits ef741b0/a97bf89) to fix real measured
+#   buildkitd throttling — a good fix for that specific problem, but it also
+#   raised the large pool's per-pod sum-of-limits from 8 to 12 CPU without
+#   redoing the cross-*pod* ceiling math this file has tracked since
+#   2026-08-22. New ceiling: baseline(~3) + large(3x12=36) + small(20x2=40)
+#   = ~79 CPU against 72 real CPUs — 7 over, worse than the 87.3-CPU/15.3-over
+#   case that originally justified dropping to 20. All 3 same-day occurrences
+#   of the nested-kind image-pull "unexpected EOF" pattern (pgvector, then
+#   timberio/vector x2 — see arc-e2e-pgvector-pull-eof memory) landed at
+#   12:59/13:09/13:15 UTC, all after the buildkitd raise. Dropping to 14
+#   brings the small pool's contribution to 28, ceiling back to ~67 — close
+#   to the same ~5 CPU buffer the 2026-08-22 change targeted. Chose to
+#   compensate here rather than revert the buildkitd raise, since that raise
+#   has its own solid evidence (cgroup cpu.stat showing 33-35% throttling)
+#   and reverting it unilaterally would undo an owner-approved fix for a
+#   different, already-diagnosed problem. Revisit alongside the buildkitd
+#   sizing if this doesn't resolve the EOF pattern, or if it turns out to be
+#   over-conservative once more data comes in.
 apiVersion: helm.cattle.io/v1
 kind: HelmChart
 metadata:
@@ -149,7 +171,7 @@ spec:
     runnerScaleSetName: ergonlabs-k8s-small
 
     minRunners: 0
-    maxRunners: 20
+    maxRunners: 14
 
     template:
       spec:
