@@ -120,8 +120,25 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 10
           resources:
+            # CPU request raised 100m -> 1000m, 2026-08-23. Investigating "the orchestrator"'s
+            # 4th-consecutive timberio/vector "unexpected EOF" report: confirmed live that this
+            # ISN'T a config/bypass problem (a live kind cluster's /etc/containerd/config.toml
+            # correctly had the docker.io -> arc-hub-mirror patch) and ISN'T a cold-cache problem
+            # (queried the mirror directly for this exact image mid-investigation, got a clean
+            # 200 instantly). That leaves the mirror pod's own request as the likely lever: 100m
+            # CPU gives this pod a tiny scheduling-weight share of contested CPU relative to
+            # everything else on the node (large-pool containers alone request 500m-4000m each),
+            # and it's a single point of failure for every Docker Hub pull across both pools — a
+            # Go proxy streaming multi-MB/GB blobs that gets starved mid-transfer during a real
+            # burst can plausibly truncate the stream client-side ("unexpected EOF") without ever
+            # crashing or logging an error itself, which matches every observation so far (mirror
+            # always healthy/8d-uptime when checked after the fact). Not proven with a live
+            # cgroup-throttle capture (same evidentiary gap as several other findings today) --
+            # a reasoned, low-risk mitigation given the node has never been anywhere near 100%
+            # CPU when checked, so this costs nothing under normal load and only matters exactly
+            # when it's needed most.
             requests:
-              cpu: 100m
+              cpu: 1000m
               memory: 128Mi
             limits:
               memory: 2Gi
