@@ -147,7 +147,13 @@ data:
     # is guarded by a live liveness re-check and rm -rf is idempotent, so at
     # worst it's some redundant du/liveness-check work, never a correctness
     # issue.)
-    THRESHOLD=90
+    # Lowered 90 -> 80 on 2026-08-23: a dependabot-merge burst (14 queued PRs after
+    # PR #220 landed) drove usage to 95% (14G free of 251G) before the 90% trigger's
+    # sweep caught up — real, observed near-miss, not theoretical. 80% starts the
+    # reactive sweep ~25G earlier, buying more runway against exactly this kind of
+    # burst before free space gets critically low. Poll/cooldown unchanged — the
+    # sweep itself was fast enough once triggered, the problem was triggering late.
+    THRESHOLD=80
     POLL_SEC=30
     COOLDOWN_AFTER_RUN_SEC=120
 
