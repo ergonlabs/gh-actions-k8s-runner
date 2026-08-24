@@ -153,7 +153,15 @@ data:
     # reactive sweep ~25G earlier, buying more runway against exactly this kind of
     # burst before free space gets critically low. Poll/cooldown unchanged — the
     # sweep itself was fast enough once triggered, the problem was triggering late.
-    THRESHOLD=80
+    #
+    # Lowered again 80 -> 65 later the same day (owner: "get it before 75 and keep
+    # it there"). 80% still let usage climb into the 90s+ before the trigger fired
+    # and the sweep caught up (the trigger is a *start* signal, not an instant
+    # floor — usage keeps climbing during the time it takes the sweep to run).
+    # Triggering at 65% instead of 80% leaves ~10 percentage points (~25G) of
+    # margin for that climb before crossing the 75% target, rather than starting
+    # the race already past it. Poll/cooldown unchanged.
+    THRESHOLD=65
     POLL_SEC=30
     COOLDOWN_AFTER_RUN_SEC=120
 
