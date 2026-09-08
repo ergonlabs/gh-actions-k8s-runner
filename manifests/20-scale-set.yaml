@@ -174,6 +174,38 @@ spec:
                 mountPath: /dind-logs
                 subPathExpr: $(POD_NAME)
 
+          # Durable doppler-operator log capture — see 26-doppler-log-capture.yaml for the why
+          # and how. Talks to the SAME dind daemon as the runner/buildkitd (shared dind-sock
+          # volume), then reaches one layer further in via `docker exec` + `crictl` to tail the
+          # nested kind cluster's doppler-operator pod, which is why this needs no Kubernetes API
+          # access of its own — just the existing docker socket.
+          - name: doppler-log-capture
+            image: docker:27-cli
+            restartPolicy: Always
+            command: ["/bin/sh", "/scripts/capture.sh"]
+            env:
+              - name: DOCKER_HOST
+                value: unix:///var/run/docker.sock
+              - name: POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+            resources:
+              requests:
+                cpu: 50m
+                memory: 64Mi
+              limits:
+                cpu: 200m
+                memory: 256Mi
+            volumeMounts:
+              - name: dind-sock
+                mountPath: /var/run
+              - name: doppler-logs
+                mountPath: /doppler-logs
+                subPathExpr: $(POD_NAME)
+              - name: doppler-log-capture-script
+                mountPath: /scripts
+
           # BuildKit, for migrating workflows off `docker build` -> `buildx`.
           - name: buildkitd
             image: moby/buildkit:latest
@@ -381,6 +413,16 @@ spec:
             hostPath:
               path: /mnt/arc-block/dind-logs
               type: Directory
+          # Durable doppler-operator log capture — see 26-doppler-log-capture.yaml and the
+          # doppler-log-capture container above. Same GC treatment as dind-logs.
+          - name: doppler-logs
+            hostPath:
+              path: /mnt/arc-block/doppler-logs
+              type: Directory
+          - name: doppler-log-capture-script
+            configMap:
+              name: arc-doppler-log-capture-script
+              defaultMode: 0755
 
           # Unix sockets only — no payload data, so local emptyDir is fine.
           - name: dind-sock

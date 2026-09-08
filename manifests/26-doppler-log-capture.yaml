@@ -1,0 +1,92 @@
+# Durable doppler-operator log capture for the large-pool ("ergonlabs-k8s") E2E runner pods.
+#
+# WHY
+#   sugarmaple-app's E2E job runs doppler-operator INSIDE a nested `kind` cluster that lives
+#   entirely inside the runner pod's dind sidecar (kind nodes are just containers inside dind's
+#   own docker daemon; doppler-operator is a containerd-managed pod inside that kind node). See
+#   arc-e2e-doppler-leader-election-timeout memory: 23+ occurrences of doppler-operator failing in
+#   at least 3 different ways (leader-election/etcd timeout, plain SecretSyncReady timeout, a
+#   token-secret-not-found bootstrap race), still unconfirmed after 23 tries specifically because
+#   the evidence disappears — the whole nested kind cluster is torn down with the pod at job end,
+#   so `kubectl logs` after the fact is a dead end (exactly the same problem the dind sidecar had
+#   before its own durable log capture was added on 2026-08-15 — see the `dind` container's
+#   command block in 20-scale-set.yaml).
+#
+#   This does the same thing for doppler-operator, entirely from the ARC side — no change to
+#   sugarmaple-app's own workflow/action code required, so it applies to every run automatically.
+#
+# HOW
+#   doppler-operator's pod is managed by containerd *inside* the kind node container, not by the
+#   outer dind daemon directly, so we can't just `docker logs` it the way dind's own dockerd
+#   output is captured. Instead this sidecar shares the pod's dind socket (same `dind-sock` volume
+#   every other container uses) and does the equivalent one layer down: find the kind control-plane
+#   container (`docker ps --filter label=io.x-k8s.kind.role=control-plane`), then `docker exec` into
+#   it to run `crictl` — kind's node image always ships crictl since it's a real kubelet+containerd
+#   node — filtered to the `doppler-operator-system` namespace, and stream each container's logs
+#   with `crictl logs -f` out to the LUN.
+#
+#   New container IDs (initial pod start, and any restart) are detected by polling `crictl ps`
+#   every 5s and diffing against IDs already being tailed; each gets its own `crictl logs -f`
+#   attached the moment it's seen. Deliberately simple: on this sidecar's OWN restart the
+#   in-container "already tailed" list resets (it's a plain /tmp file, not on the LUN), so a
+#   still-running container gets re-attached and its buffered history re-appended, duplicating a
+#   chunk of log — an acceptable wart for a forensic tool, since duplicated data beats missing data.
+#
+# OUTPUT
+#   /mnt/arc-block/doppler-logs/<pod-name>/manager-<container-id>.log — one file per container
+#   instance, so a mid-run restart never overwrites the previous instance's log.
+#   /mnt/arc-block/doppler-logs/<pod-name>/containers-seen.log — periodic `crictl ps` snapshots
+#   (id/name/state/pod), the index for cross-referencing which log file is which pod/attempt.
+#   /mnt/arc-block/doppler-logs/<pod-name>/capture.log — this sidecar's own progress/attach events.
+#   GC'd by 30-store-gc.yaml exactly like dind-logs/docker/buildkit/externals/work — added to that
+#   script's store list, same 10-minute-since-last-write + live-pod-liveness-recheck safety.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: arc-doppler-log-capture-script
+  namespace: arc-runners
+data:
+  capture.sh: |
+    set -uo pipefail
+
+    OUTDIR=/doppler-logs
+    mkdir -p "$OUTDIR"
+    INDEX="$OUTDIR/containers-seen.log"
+    LOG="$OUTDIR/capture.log"
+    TAILED_FILE=/tmp/tailed_ids
+    : > "$TAILED_FILE"
+
+    ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+    echo "$(ts) doppler-log-capture: waiting for a kind control-plane container..." >> "$LOG"
+
+    NODE=""
+    while [ -z "$NODE" ]; do
+        NODE=$(docker ps --filter "label=io.x-k8s.kind.role=control-plane" --format '{{.Names}}' 2>/dev/null | head -1)
+        [ -n "$NODE" ] && break
+        sleep 2
+    done
+    echo "$(ts) doppler-log-capture: found kind node container '$NODE'" >> "$LOG"
+
+    while true; do
+        LINE_OUT=$(docker exec "$NODE" crictl ps -a --no-trunc --label io.kubernetes.pod.namespace=doppler-operator-system 2>/dev/null)
+        if [ -n "$LINE_OUT" ]; then
+            { echo "$(ts) --- crictl ps snapshot ---"; echo "$LINE_OUT"; } >> "$INDEX"
+            IDS=$(echo "$LINE_OUT" | tail -n +2 | awk '{print $1}')
+            for id in $IDS; do
+                if ! grep -qx "$id" "$TAILED_FILE" 2>/dev/null; then
+                    echo "$id" >> "$TAILED_FILE"
+                    NAME=$(echo "$LINE_OUT" | awk -v id="$id" '$1==id{print $5; exit}')
+                    echo "$(ts) attaching log tail: container=$id name=$NAME" >> "$LOG"
+                    (
+                        {
+                            echo "$(ts) === tail started for container $id ($NAME) ==="
+                            docker exec "$NODE" crictl logs -f --timestamps "$id"
+                            echo "$(ts) === tail ended for container $id ($NAME) ==="
+                        } >> "$OUTDIR/manager-$id.log" 2>&1
+                    ) &
+                fi
+            done
+        fi
+        sleep 5
+    done

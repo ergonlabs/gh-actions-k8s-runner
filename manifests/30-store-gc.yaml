@@ -103,9 +103,22 @@ data:
     # anything freshly touched.
     MIN_AGE_MIN=10
 
+    # Forensic per-pod log captures (dind's dockerd.log, doppler-operator's manager logs —
+    # see the dind/doppler-log-capture containers in 20-scale-set.yaml) are tiny (KBs-MBs) on a
+    # 251 GB LUN that sits around 28% used, so there is no real disk-pressure reason to sweep
+    # them on the same 10-minute clock as the multi-GB docker/buildkit/work stores. The whole
+    # point of capturing them durably is to survive long enough for someone to actually go read
+    # them after a CI failure — and the 10-minute default defeats that in practice: confirmed
+    # 2026-09-04, /mnt/arc-block/doppler-logs and /mnt/arc-block/dind-logs were BOTH empty when
+    # checked hours after failures that definitely ran on pods carrying that sidecar (see
+    # arc-e2e-doppler-leader-election-timeout memory). Retention here is days, not minutes.
+    LOG_MIN_AGE_MIN=$((3 * 24 * 60))  # 3 days
+
     FREED=0; KEPT=0; SKIPPED=0
-    for base in /stores/docker /stores/buildkit /stores/externals /stores/work /stores/dind-logs; do
-        [ -d "$base" ] || continue
+
+    sweep() {
+        base="$1"; min_age="$2"
+        [ -d "$base" ] || return
         for d in "$base"/*; do
             [ -d "$d" ] || continue
             name=$(basename "$d")
@@ -113,8 +126,8 @@ data:
             case "$name" in ergonlabs-k8s-*) ;; *) continue ;; esac
 
             # Guard 1: skip anything recently modified.
-            if [ -n "$(find "$d" -maxdepth 0 -mmin -$MIN_AGE_MIN 2>/dev/null)" ]; then
-                echo "skip   $d (modified in last ${MIN_AGE_MIN}m)"
+            if [ -n "$(find "$d" -maxdepth 0 -mmin -$min_age 2>/dev/null)" ]; then
+                echo "skip   $d (modified in last ${min_age}m)"
                 SKIPPED=$((SKIPPED + 1)); continue
             fi
 
@@ -135,7 +148,15 @@ data:
             rm -rf "$d" && echo "delete $d (${sz:-?} MB)" \
                         && FREED=$((FREED + ${sz:-0}))
         done
+    }
+
+    for base in /stores/docker /stores/buildkit /stores/externals /stores/work; do
+        sweep "$base" "$MIN_AGE_MIN"
     done
+    for base in /stores/dind-logs /stores/doppler-logs; do
+        sweep "$base" "$LOG_MIN_AGE_MIN"
+    done
+
     echo "freed ~${FREED} MB; kept $KEPT; skipped $SKIPPED (too recent)"
     df -h /stores 2>/dev/null | grep -v '^Filesystem'
   watch.sh: |
