@@ -105,6 +105,32 @@ spec:
                 secretKeyRef:
                   name: arc-hub-mirror-credentials
                   key: password
+            # ROOT CAUSE FIX, 2026-09-07/08 — this is not optional, do not remove.
+            # The image's default config.yml sets storage.cache.blobdescriptor: inmemory.
+            # Under concurrent first-pulls of the same not-yet-cached blob (routine here —
+            # every E2E job's `observability` namespace pulls the same handful of
+            # third-party images at roughly the same moment during cluster bootstrap, and
+            # multiple E2E jobs run concurrently across both pools), the registry can cache
+            # a bad/zero-length descriptor in memory for a digest. Once that happens, EVERY
+            # future request for that digest gets served HTTP 200 + 0 bytes from memory —
+            # regardless of what's actually on disk — until the pod restarts. This produced
+            # 19+ "short read: expected N bytes but got 0: unexpected EOF" -> ErrImagePull
+            # failures in sugarmaple-app's e2e-cluster-bootstrap over a few hours (see
+            # arc-e2e-mirror-blob-broken-pipe memory for the full incident history,
+            # including two earlier, incomplete mitigations: deleting the dangling on-disk
+            # `_layers` link, and 46-hub-mirror-blob-sweep.yaml's periodic sweep — both only
+            # ever touched disk and got silently undone by this same in-memory cache within
+            # minutes). Empty value disables the cache layer entirely (distribution/
+            # distribution only wraps the blobstore with a descriptor cache when this
+            # config value is non-empty) — every request re-checks disk fresh instead.
+            # Stress-tested by forcing a blob cold and firing 10 truly concurrent requests
+            # at it (the exact trigger condition): all 10 returned correct content.
+            # This was ALSO reapplied here after being caught live-cluster-only via
+            # `kubectl set env` — if you ever `kubectl apply` this file and see the mirror
+            # start corrupting blobs again, check this line is still present before
+            # anything else.
+            - name: REGISTRY_STORAGE_CACHE_BLOBDESCRIPTOR
+              value: ""
           ports:
             - containerPort: 5000
           readinessProbe:

@@ -389,6 +389,86 @@ is unset in a live runner pod.
 **Wider lesson.** Adding a tool to close one gap (finding #4) opened a different one. After any
 image change, re-run the *whole* verification, not just the thing you set out to fix.
 
+## 15. `arc-hub-mirror` corrupts blobs under concurrency unless the descriptor cache is disabled
+
+**Symptom.** `e2e-cluster-bootstrap` fails pulling a routine third-party image (seen on
+`timberio/vector`, `victoriametrics/victoria-logs`, `dopplerhq/kubernetes-operator`, `qdrant/
+qdrant`) with:
+
+```
+Failed to pull image "docker.io/<repo>:<tag>": failed to pull and unpack image "...":
+short read: expected N bytes but got 0: unexpected EOF
+Error: ErrImagePull
+```
+
+The mirror's own access log shows `HTTP 200` with `written=0` for that exact blob, repeatedly,
+across different client pods and different digests over time — not a one-off. This recurred 19+
+times over a few hours on 2026-09-07/08 before being root-caused. Two earlier fix attempts both
+looked successful for a few minutes and then silently stopped working:
+1. Deleting the on-disk dangling `_layers/sha256/<hash>/link` (no backing blob data) — fixed the
+   disk, but the exact same digest broke again within ~5 minutes on a fresh concurrent pull.
+2. `46-hub-mirror-blob-sweep.yaml`, a CronJob that finds and deletes dangling links every 5
+   min — genuinely useful for the disk-level case, but structurally can't detect or fix the real
+   cause below, so failures kept recurring on its watch (`checked=N removed=0` right before a
+   fresh corruption).
+
+**Cause.** `registry:2`'s default `config.yml` sets `storage.cache.blobdescriptor: inmemory`.
+Under concurrent first-pulls of the *same* not-yet-cached blob — routine here, since every E2E
+job's `observability` namespace pulls the same handful of third-party images at roughly the same
+moment during cluster bootstrap, and multiple E2E jobs run concurrently across both runner
+pools — the registry can cache a bad/zero-length descriptor in memory for that digest. Once that
+happens, **every subsequent request for that digest is served the poisoned in-memory result**
+(`200` + 0 bytes) regardless of what's actually on disk, until the process restarts. That's why
+disk-only fixes (deleting the link, even a verified clean single re-fetch) kept getting silently
+undone — the mirror was serving `200`/0 straight from memory before ever checking the (correct)
+file. The exact write-path race that produces the bad descriptor in the first place is still
+unconfirmed and is now moot for this environment (see Fix).
+
+**Fix.** Disable the descriptor cache entirely:
+
+```yaml
+- name: REGISTRY_STORAGE_CACHE_BLOBDESCRIPTOR
+  value: ""
+```
+
+(already in `45-hub-mirror.yaml`, on the `registry` container). Empty value disables the cache
+layer outright — `distribution/distribution` only wraps the blobstore with a descriptor cache
+when this config value is non-empty — so every request re-checks disk fresh. `kubectl set env`
+(or reapplying this manifest) triggers a normal zero-downtime rolling restart, which also clears
+whatever was already poisoned in memory at apply time.
+
+**Verify.** Don't trust response headers alone (`Content-Length` can be checked without the body
+matching if you only inspect headers, which is what an earlier verification attempt did before
+the fix recurred). Fetch the body and count actual bytes:
+```bash
+POD=$(kubectl get pods -n arc-runners -l app=arc-hub-mirror -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n arc-runners "$POD" -- sh -c 'wget -q -O /tmp/x http://localhost:5000/v2/<repo>/blobs/sha256:<hash>; wc -c /tmp/x'
+```
+To reproduce the actual trigger condition (not just a single fetch), force a blob cold and fire
+several truly concurrent requests at it:
+```bash
+kubectl exec -n arc-runners "$POD" -- find /var/lib/registry/docker/registry/v2/repositories/<org>/<repo>/_layers/sha256/<hash> -maxdepth 0 -exec rm -rf {} \;
+kubectl exec -n arc-runners "$POD" -- sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do wget -q -O /tmp/o$i http://localhost:5000/v2/<repo>/blobs/sha256:<hash> & done; wait; for i in 1 2 3 4 5 6 7 8 9 10; do wc -c /tmp/o$i; done'
+```
+All 10 should return the correct byte count. If any return 0, the fix isn't active — check
+`kubectl exec ... env | grep REGISTRY` on the running pod (the static `/etc/docker/registry/
+config.yml` inside the image still shows `blobdescriptor: inmemory`; that's expected, env vars
+override at runtime without rewriting the baked-in file — don't be fooled by `cat`-ing it).
+
+**Generalise this.** `kubectl set env` (or any live-cluster-only patch) is not a fix, it's a
+patch that silently reverts the next time this manifest is reapplied. Whenever you fix something
+live under time pressure, immediately mirror the change into the manifest before considering it
+done — `kubectl diff -f <manifest>` should show no drift once you have.
+
+**Wider lesson.** A response with the right headers is not proof of a correct body. When a fix
+"stops working" faster than physically plausible for the failure mode you think you fixed
+(minutes, not the next unrelated occurrence), suspect a cache serving stale results ahead of
+whatever you just corrected, not a fresh instance of the same root cause.
+
+Full incident history (19+ occurrences, two earlier partial mitigations, multiple sessions
+converging on the same finding independently): see the `arc-e2e-mirror-blob-broken-pipe` memory
+in `~/.claude/projects/-home-stefanrusek/memory/`.
+
 ## 13. Things that look like problems but aren't
 
 - **`docker system prune` frees nothing.** On a box like this Docker reports 0 B reclaimable

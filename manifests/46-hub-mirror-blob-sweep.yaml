@@ -1,0 +1,117 @@
+# Periodic sweep for dangling blobs in arc-hub-mirror's storage.
+#
+# WHY
+#   arc-hub-mirror (45-hub-mirror.yaml) is a stock `registry:2` in proxy
+#   (pull-through cache) mode. Under concurrent first-pulls of the same
+#   uncached blob — which happens constantly here, since every E2E job
+#   bootstraps the same third-party images (timberio/vector,
+#   victoriametrics/victoria-logs, qdrant/qdrant, ...) at roughly the same
+#   time during cluster bootstrap — the registry can leave a repository-level
+#   `_layers/sha256/<hash>/link` file pointing at a blob whose actual content
+#   was never committed to `/blobs/sha256/<xx>/<hash>/data`. No error is ever
+#   logged for this. Once that happens, the registry answers every future
+#   request for that blob with `HTTP 200` + 0 bytes (instead of a 404),
+#   because it only checks the link, not the backing data. Every
+#   containerd/buildkit client that hits it then fails with
+#   "short read: expected N bytes but got 0: unexpected EOF" -> ErrImagePull,
+#   permanently, until someone finds and deletes the dangling link by hand.
+#
+#   First diagnosed + hand-fixed 2026-09-07 (see arc-e2e-mirror-blob-broken-pipe
+#   memory) — recurred with a DIFFERENT blob hash within a couple of hours,
+#   confirming this is an ongoing race in the registry's proxy blob store, not
+#   a one-off. This CronJob makes the fix automatic instead of requiring
+#   someone to notice a CI failure, dig through mirror access logs, and
+#   manually exec into the pod every time it happens.
+#
+# WHAT IT DOES
+#   For every `_layers/sha256/<hash>/link` under every repository, checks
+#   whether `/blobs/sha256/<xx>/<hash>/data` exists. If it doesn't, the link
+#   is dangling and gets deleted. This is always safe: deleting a dangling
+#   link only makes the registry correctly report the blob as missing, which
+#   makes it re-fetch fresh from Docker Hub on the next request (proxy mode).
+#   It never touches a link whose backing blob data is present.
+#
+# WHAT IT DOES NOT DO
+#   It does not explain WHY the registry leaves blobs in this state — that's
+#   an upstream `distribution/distribution` proxy-mode concurrency gap, not
+#   something fixable from this side. This is a mitigation, not a root-cause
+#   fix. If corruption keeps recurring at a rate this can't keep ahead of,
+#   the next lever is pre-warming the small fixed set of third-party images
+#   every E2E job needs (so they're cached before concurrent jobs race for
+#   them), not tightening this cadence further.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: arc-hub-mirror-blob-sweep-script
+  namespace: arc-runners
+data:
+  sweep.sh: |
+    set -uo pipefail
+
+    REPO_ROOT=/data/docker/registry/v2/repositories
+    BLOB_ROOT=/data/docker/registry/v2/blobs/sha256
+
+    [ -d "$REPO_ROOT" ] || { echo "no repositories dir yet, nothing to sweep"; exit 0; }
+
+    LINKS=$(mktemp)
+    find "$REPO_ROOT" -type f -path '*/_layers/sha256/*/link' 2>/dev/null > "$LINKS"
+
+    CHECKED=0
+    REMOVED=0
+
+    while IFS= read -r link; do
+        CHECKED=$((CHECKED + 1))
+        linkdir=$(dirname "$link")
+        hash=$(basename "$linkdir")
+        prefix=$(printf '%s' "$hash" | cut -c1-2)
+
+        if [ ! -f "$BLOB_ROOT/$prefix/$hash/data" ]; then
+            echo "dangling: $linkdir (no backing blob data — deleting)"
+            rm -rf "$linkdir"
+            REMOVED=$((REMOVED + 1))
+        fi
+    done < "$LINKS"
+
+    rm -f "$LINKS"
+    echo "sweep complete: checked=$CHECKED removed=$REMOVED"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: arc-hub-mirror-blob-sweep
+  namespace: arc-runners
+spec:
+  # Every 5 min, matching arc-store-gc's cadence — this issue has recurred
+  # within a couple hours of the last fix, so a slow cadence just means more
+  # CI jobs hit a dangling blob before the sweep clears it.
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            runAsUser: 0   # mirror storage is root-owned 0755
+          containers:
+            - name: sweep
+              image: busybox:latest
+              command: ["/bin/sh", "/scripts/sweep.sh"]
+              volumeMounts:
+                - name: mirror-data
+                  mountPath: /data
+                - name: sweep-script
+                  mountPath: /scripts
+          volumes:
+            - name: mirror-data
+              hostPath:
+                path: /mnt/arc-block/hub-mirror
+                type: Directory
+            - name: sweep-script
+              configMap:
+                name: arc-hub-mirror-blob-sweep-script
+                defaultMode: 0755
