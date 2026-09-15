@@ -46,6 +46,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # cancel ...`, used across ci.yml to stop e2e-tests early when any gate job
 # fails) silently no-op'd with "gh: command not found" instead of failing
 # fast — found 2026-08-21 via apps/admin gate job 96835226815.
+# The apt source is removed again after install (not just the cache) — leaving
+# it in /etc/apt/sources.list.d meant every LATER apt-get update in any CI job
+# (e.g. Playwright's `--with-deps` step below) stayed exposed to cli.github.com
+# for no benefit, since gh itself doesn't need the repo once installed. That bit
+# us 2026-09-15: a cli.github.com mirror hiccup ("Mirror sync in progress?")
+# failed an unrelated E2E job's `playwright install --with-deps chromium` step.
 RUN set -eux; \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       | gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg; \
@@ -55,7 +61,7 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends gh; \
     apt-get clean; \
-    rm -rf /var/lib/apt/lists/*; \
+    rm -rf /var/lib/apt/lists/* /etc/apt/sources.list.d/github-cli.list /usr/share/keyrings/githubcli-archive-keyring.gpg; \
     gh --version
 
 # ---------------------------------------------------------------------------
@@ -172,11 +178,14 @@ RUN set -eux; \
 # it here needs NO workflow change — the runtime step becomes a fast no-op.
 #
 # Version MUST match test/e2e/package.json in ergonlabs/sugarmaple-app
-# (pinned via pnpm-lock.yaml to playwright@1.60.0 as of 2026-08-14) — browser
-# revisions are tied to the exact playwright version, not just its major.
-# If sugarmaple-app bumps this dependency, this cache silently misses and the
-# runtime step falls back to downloading fresh (slower, not broken) until
-# this ARG is bumped to match.
+# (pinned via pnpm-lock.yaml to playwright@1.62.1 as of 2026-09-15, bumped
+# from 1.60.0) — browser revisions are tied to the exact playwright version,
+# not just its major. If sugarmaple-app bumps this dependency, this cache
+# silently misses and the runtime step falls back to downloading fresh —
+# not just slower: that fallback does a real `apt-get update`, so it's also
+# exposed to whatever's flaky in the OS package mirrors that day (see the
+# github-cli.list note above — that's exactly how the 2026-09-15 drift
+# surfaced, as an E2E job failure that looked infra-unrelated at first).
 #
 # Node here is build-time-only, to run the playwright CLI once, and is
 # unrelated to the per-job Node that actions/setup-node installs from
@@ -192,7 +201,7 @@ RUN set -eux; \
 # under .cache/ (e.g. Go's build cache) failed with
 # `mkdir /home/runner/.cache/go-build: permission denied`. Broke the
 # git-service Go quality gates job in production on 2026-08-14.
-ARG PLAYWRIGHT_VERSION=1.60.0
+ARG PLAYWRIGHT_VERSION=1.62.1
 ARG NODE_VERSION=24.19.0
 ENV PLAYWRIGHT_BROWSERS_PATH=/home/runner/.cache/ms-playwright
 RUN set -eux; \
