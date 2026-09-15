@@ -469,6 +469,44 @@ Full incident history (19+ occurrences, two earlier partial mitigations, multipl
 converging on the same finding independently): see the `arc-e2e-mirror-blob-broken-pipe` memory
 in `~/.claude/projects/-home-stefanrusek/memory/`.
 
+## 16. Playwright version drift turns a no-op preload into a real apt-get update
+
+**Symptom.** An E2E job fails fast (~70s in), in the `e2e-cluster-bootstrap` step, with an
+`apt-get update` error against an unrelated repo, e.g.:
+
+```
+E: Failed to fetch https://cli.github.com/packages/dists/stable/main/binary-amd64/Packages.gz
+   File has unexpected size (359 != 356). Mirror sync in progress?
+Failed to install browsers
+ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL  Command failed with exit code 1: playwright install --with-deps chromium
+```
+
+This looks like an unrelated apt-mirror blip (and partly is — see below), but the job shouldn't
+have been running `apt-get` here at all.
+
+**Cause.** The runner image pre-bakes Playwright's Chromium at a pinned `PLAYWRIGHT_VERSION` so
+the per-job `playwright install --with-deps chromium` step is normally a fast no-op (see finding
+in the Dockerfile's own comments, `runner-image/Dockerfile` around `ARG PLAYWRIGHT_VERSION`).
+When `sugarmaple-app` bumps its own `playwright`/`@playwright/test` pin (here: 1.60.0 → 1.62.1,
+2026-09-15) without the image's `ARG` being bumped to match, the cache key changes, the preload
+silently misses, and `playwright install` falls back to a **real** install — which does a real
+`apt-get update`, newly exposing the job to whatever's flaky in the OS package mirrors that day.
+Here it happened to be `cli.github.com`'s repo (added to the image for `gh`, see finding above
+this one in Dockerfile history) hitting a transient mirror-sync glitch.
+
+**Fix.** Bump `ARG PLAYWRIGHT_VERSION` in `runner-image/Dockerfile` to match
+`test/e2e/package.json`'s resolved version in `sugarmaple-app`'s `pnpm-lock.yaml` (not the caret
+range — browser revisions are tied to the exact version), rebuild, push a new date-tagged image,
+bump the tag in both `20-scale-set.yaml` and `21-scale-set-small.yaml`, apply when the pool is
+idle. Also removed `/etc/apt/sources.list.d/github-cli.list` after installing `gh` in the same
+Dockerfile stage — it was never needed post-install and was the immediate thing that turned this
+version-drift into an actual failure instead of just a slower job.
+
+**Generalise this.** Any "pin X to match version Y in another repo" pre-bake (this one, or
+future ones) needs the two to move together. There's no automated check today — this was only
+caught by a real job failure. If this recurs, consider a scheduled diff between the image's pin
+and `sugarmaple-app`'s lockfile rather than waiting for a failure.
+
 ## 13. Things that look like problems but aren't
 
 - **`docker system prune` frees nothing.** On a box like this Docker reports 0 B reclaimable
