@@ -1,0 +1,48 @@
+name: Runner resource report
+description: >-
+  Uploads a per-container CPU/memory report (single self-contained HTML page with charts, plus
+  the raw per-second CSV) for the current job as a build artifact. Works on the ergonlabs-k8s
+  ARC runners, whose pods are sampled by arc-resource-sampler; anywhere else it logs a notice
+  and does nothing. Never fails the job.
+
+  Put it LAST in the job with `if: always()` so it covers every earlier step and still runs
+  when one fails:
+
+    - uses: ergonlabs/gh-actions-k8s-runner/resource-report@main
+      if: always()
+
+inputs:
+  name:
+    description: Artifact name. Defaults to resource-report-<job id>-<runner name>, which is unique per job even in matrices.
+    default: ""
+  retention-days:
+    description: Artifact retention.
+    default: "14"
+
+runs:
+  using: composite
+  steps:
+    - id: render
+      shell: bash
+      run: |
+        out="$RUNNER_TEMP/resource-report"
+        # No --summary here: the runner's job-completed hook writes the job summary (with
+        # complete data, after every step); this step only produces the files to upload.
+        if timeout 60 python3 "$GITHUB_ACTION_PATH/../runner-image/resource-report/render.py" --out "$out"; then
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "::notice title=resource-report::No resource samples for this runner (not an arc-resource-sampler pod) — skipping."
+        fi
+        name="$INPUT_NAME"
+        [ -n "$name" ] || name="resource-report-${GITHUB_JOB}-${RUNNER_NAME}"
+        echo "name=$name" >> "$GITHUB_OUTPUT"
+      env:
+        INPUT_NAME: ${{ inputs.name }}
+    - if: steps.render.outputs.ready == 'true'
+      uses: actions/upload-artifact@v4
+      continue-on-error: true
+      with:
+        name: ${{ steps.render.outputs.name }}
+        path: ${{ runner.temp }}/resource-report
+        retention-days: ${{ inputs.retention-days }}
+        if-no-files-found: ignore

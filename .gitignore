@@ -13,3 +13,6 @@ tmp/
 
 # Ephemeral session-handoff artifacts — never commit
 handoff-*.md
+
+# Python bytecode
+__pycache__/

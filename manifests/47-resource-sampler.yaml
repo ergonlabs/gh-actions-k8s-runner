@@ -1,0 +1,124 @@
+# Per-container CPU/memory sampler for runner pods -> per-job resource reports.
+#
+# WHY
+#   Sizing the pools (requests, limits, maxRunners) has so far relied on one-off snapshots
+#   taken by hand while a job happened to be running (e.g. the 2026-08-23 buildkitd cpu.stat
+#   read). Nothing kept a time series, and this kernel (5.15) has no cgroup `memory.peak`
+#   (added in 5.19), so a finished pod can't even say what its high-water mark was. The only
+#   way to catch a memory spike is to sample while it happens.
+#
+# HOW
+#   This DaemonSet reads every runner pod's cgroup v2 files straight from the host tree
+#   (/sys/fs/cgroup/kubepods.slice, read-only) once per second, per container — runner, dind,
+#   buildkitd, doppler-log-capture — plus node-wide /proc context, and appends raw counters to
+#   /mnt/arc-block/resource-metrics/<pod-name>/samples.jsonl. It uses the API (get/list pods
+#   only) to map containerd scope IDs to container names; cgroup dirs don't carry names.
+#
+#   Each runner container mounts its OWN pod's directory read-only (subPathExpr, see the
+#   `resource-metrics` volume in 20-/21-scale-set.yaml), and the runner's
+#   ACTIONS_RUNNER_HOOK_JOB_COMPLETED hook (runner-image/resource-report/) renders it into an
+#   HTML report + job summary. The optional `resource-report` composite action at the repo root
+#   uploads that report as a build artifact.
+#
+#   Sampling from outside the pod (rather than a sampler process inside the runner) is what
+#   makes the sidecars visible: everything inside dind — including the E2E job's nested kind
+#   cluster — is billed to the dind container's cgroup.
+#
+# STORAGE / RETENTION
+#   ~0.5 KB per pod per second. Once a pod is gone (confirmed by an individual GET, same
+#   re-check-before-delete rule as store-gc — see 30-store-gc.yaml), its data is gzipped into
+#   _archive/<YYYY-MM-DD>/ and the live dir removed; archive days older than 30 are dropped.
+#   The archive is the raw material for pool-level analysis across many jobs.
+#
+# The script lives in resource-report/sampler.py; scripts/install.sh creates the
+# `arc-resource-sampler-script` ConfigMap from it. After editing the script:
+#   kubectl -n arc-runners create configmap arc-resource-sampler-script \
+#     --from-file=sampler.py=resource-report/sampler.py --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl -n arc-runners rollout restart ds/arc-resource-sampler
+# (Restarting it never touches runner pods; a restart just leaves a gap of a few seconds.)
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: arc-resource-sampler
+  namespace: arc-runners
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: arc-resource-sampler
+  namespace: arc-runners
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    # "get" is used to re-confirm a pod is gone before archiving its data (see header).
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: arc-resource-sampler
+  namespace: arc-runners
+subjects:
+  - kind: ServiceAccount
+    name: arc-resource-sampler
+    namespace: arc-runners
+roleRef:
+  kind: Role
+  name: arc-resource-sampler
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: arc-resource-sampler
+  namespace: arc-runners
+spec:
+  selector:
+    matchLabels:
+      app: arc-resource-sampler
+  template:
+    metadata:
+      labels:
+        app: arc-resource-sampler
+    spec:
+      serviceAccountName: arc-resource-sampler
+      securityContext:
+        runAsUser: 0   # writes root-owned dirs on the LUN, chmods them readable for uid 1001
+      containers:
+        - name: sampler
+          image: python:3.13-alpine
+          command: ["python3", "-u", "/scripts/sampler.py"]
+          env:
+            - name: SAMPLE_INTERVAL_S
+              value: "1"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: host-cgroup
+              mountPath: /host-cgroup
+              readOnly: true
+            - name: data
+              mountPath: /data
+            - name: script
+              mountPath: /scripts
+      volumes:
+        - name: host-cgroup
+          hostPath:
+            path: /sys/fs/cgroup/kubepods.slice
+            type: Directory
+        # DirectoryOrCreate (unlike the stores' `Directory`) is fine here: if the LUN were
+        # unmounted, the runner pods' own `work` volume already fails them loudly, and this
+        # data is small enough that briefly landing on / would be harmless.
+        - name: data
+          hostPath:
+            path: /mnt/arc-block/resource-metrics
+            type: DirectoryOrCreate
+        - name: script
+          configMap:
+            name: arc-resource-sampler-script

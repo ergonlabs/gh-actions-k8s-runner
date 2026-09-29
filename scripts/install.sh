@@ -129,6 +129,12 @@ K apply -f manifests/20-scale-set.yaml
 step "Runner scale set ($RUNNER_SCALE_SET_NAME_SMALL, small/no-docker)"
 K apply -f manifests/21-scale-set-small.yaml
 
+step "Resource sampler (per-job CPU/memory reports)"
+K create configmap arc-resource-sampler-script -n arc-runners \
+  --from-file=sampler.py="$ROOT/resource-report/sampler.py" \
+  --dry-run=client -o yaml | K apply -f -
+K apply -f manifests/47-resource-sampler.yaml
+
 step "Per-pod store GC (NOT optional — see docs/findings.md #7)"
 K apply -f manifests/30-store-gc.yaml
 K apply -f manifests/35-store-gc-pressure.yaml
