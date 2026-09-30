@@ -277,7 +277,8 @@ def proc_comm(pid):
 
 
 _POD_UID_RE = __import__("re").compile(r"pod([0-9a-f_]{36})\.slice/cri-containerd-")
-_KIND_POD_RE = __import__("re").compile(r"-pod[0-9a-f_]{36}\.slice$")
+# 36 = a dashed API-server uid; 32 = a static pod's config-hash uid (etcd, kube-apiserver, ...)
+_KIND_POD_RE = __import__("re").compile(r"-pod(?:[0-9a-f_]{36}|[0-9a-f]{32})\.slice$")
 
 
 def owner_pod_uid(pid, cid):
@@ -350,7 +351,7 @@ def discover_nested(uid_to_pod, known):
                         continue
                     for p in cg_pids(os.path.join(pd, c)):
                         comm = proc_comm(p)
-                        if comm in (None, "pause"):
+                        if comm in (None, "pause") or comm.startswith("runc:"):  # runc: = mid-exec
                             continue
                         h = proc_env(p, b"HOSTNAME")
                         # hostNetwork pods (etcd, apiserver, kube-proxy, kindnet) inherit the
