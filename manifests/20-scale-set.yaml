@@ -123,6 +123,14 @@ spec:
               - |
                 set -e
                 mkdir -p /dind-logs
+                # /var/run is the pod-shared dind-sock emptyDir, so it OUTLIVES a dind
+                # container restart. A pid file left by the previous instance names a PID
+                # that, in the new container, belongs to some other live process — dockerd
+                # then refuses forever ("failed to save containerd pid to disk: process with
+                # PID 17 is still running"): 2026-09-30, one pod looped 53x over 4h and held
+                # a large-pool slot while an E2E job sat queued. This container is the only
+                # dockerd in the pod, so at its start any pid file here is stale.
+                rm -f /var/run/docker.pid /var/run/docker/containerd/containerd.pid
                 trap 'kill -TERM "$child" 2>/dev/null' TERM INT
                 dockerd \
                   --host=unix:///var/run/docker.sock \
