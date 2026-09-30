@@ -86,7 +86,7 @@ spec:
             # ghcr.io/actions/actions-runner lacks libatomic1, which Node 26 needs.
             # Both this and the runner container MUST use the same image: the init
             # container copies /home/runner/externals out of it.
-            image: localhost:5001/ergonlabs/actions-runner:2026-09-15
+            image: localhost:5001/ergonlabs/actions-runner:2026-09-29
             command: ["cp"]
             args: ["-r", "-v", "/home/runner/externals/.", "/home/runner/tmpDir/"]
             env:
@@ -315,7 +315,7 @@ spec:
             # ghcr.io/actions/actions-runner lacks libatomic1, which Node 26 needs.
             # Both this and the runner container MUST use the same image: the init
             # container copies /home/runner/externals out of it.
-            image: localhost:5001/ergonlabs/actions-runner:2026-09-15
+            image: localhost:5001/ergonlabs/actions-runner:2026-09-29
             command: ["/home/runner/run.sh"]
             env:
               - name: POD_NAME
@@ -352,6 +352,11 @@ spec:
               # no effect.
               - name: ACTIONS_RESULTS_URL
                 value: http://arc-cache.arc-runners.svc.cluster.local:3000/
+              # Per-job CPU/memory report: renders this pod's samples from
+              # arc-resource-sampler (47-resource-sampler.yaml) into the job summary.
+              # The hook always exits 0 — a failing job hook would fail the job.
+              - name: ACTIONS_RUNNER_HOOK_JOB_COMPLETED
+                value: /opt/resource-report/job-completed.sh
             resources:
               requests:
                 cpu: "2"
@@ -372,9 +377,23 @@ spec:
               # /dev/shm. See the volume definition below.
               - name: dshm
                 mountPath: /dev/shm
+              # This pod's own resource samples (read-only; written by
+              # arc-resource-sampler from the host's cgroups, 47-resource-sampler.yaml).
+              - name: resource-metrics
+                mountPath: /resource-metrics
+                subPathExpr: $(POD_NAME)
+                readOnly: true
 
         # ---------- storage ----------
         volumes:
+          # Per-pod resource samples written by arc-resource-sampler; each runner mounts
+          # only its own subdir, read-only. DirectoryOrCreate for the same reason as the
+          # sampler's own mount (see 47-resource-sampler.yaml): `work` already fails the pod
+          # loudly if the LUN is missing.
+          - name: resource-metrics
+            hostPath:
+              path: /mnt/arc-block/resource-metrics
+              type: DirectoryOrCreate
           # Job workspace -> iSCSI LUN, NOT NFS.
           #
           # NFS wins on sequential throughput (564 MB/s vs 69 MB/s for the local

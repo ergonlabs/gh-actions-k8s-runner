@@ -50,6 +50,7 @@ device, a GitHub App, and a registry.
 | `arc-store-gc` | `arc-runners` | CronJob reclaiming per-pod dirs (**not optional**) |
 | `arc-store-gc-pressure` | `arc-runners` | reactive companion to arc-store-gc, triggers on disk pressure |
 | `arc-node-tuning` | `arc-systems` | DaemonSet raising host inotify + AIO limits |
+| `arc-resource-sampler` | `arc-runners` | DaemonSet sampling every runner container's CPU/memory each second (per-job reports) |
 
 Charts are installed through k3s's built-in `HelmChart` CRD, so **no native `helm` binary is
 added to the host**.
@@ -61,13 +62,41 @@ ARC needs **no ports, no Ingress, no NodePort** — it long-polls outbound only.
 ```
 manifests/       numbered, apply in order
   00-namespaces  10-controller  20-scale-set  21-scale-set-small  30-store-gc
-  35-store-gc-pressure  40-cache-server  45-hub-mirror  50-node-tuning
-runner-image/    Dockerfile for the custom runner image
+  35-store-gc-pressure  40-cache-server  45-hub-mirror  47-resource-sampler  50-node-tuning
+runner-image/    Dockerfile for the custom runner image (+ resource-report/ hook + renderer)
+resource-report/ sampler.py (the DaemonSet's script) and action.yml (artifact upload action)
 host/            things that need root: iSCSI setup, sysctl drop-in, sudoers drop-in
 scripts/         install.sh, verify.sh
 docs/            architecture, findings, prerequisites, runbook
 config.env       your values (gitignored; copy from config.env.example)
 ```
+
+## Per-job resource reports
+
+Every job on either pool gets a CPU/memory report, with no workflow changes:
+
+- `arc-resource-sampler` (`manifests/47-resource-sampler.yaml`) reads each runner pod's
+  cgroup v2 counters from the host once per second, **per container** (runner, dind,
+  buildkitd, …), into `/mnt/arc-block/resource-metrics/<pod>/`. Finished pods are gzipped into
+  `_archive/<day>/` for 30 days — raw material for pool-level sizing analysis.
+- Each runner mounts its own pod's slice read-only at `/resource-metrics`, and the runner's
+  job-completed hook renders it into the **job summary**: peak/p95 working set vs limit, OOM
+  kills, CPU avg/peak vs limit, throttling, and the heaviest steps.
+- For the full single-page HTML report (charts per container, memory composition, pressure
+  stalls, node context, step bands) as a **build artifact**, add one step at the end of a job:
+
+  ```yaml
+  - uses: ergonlabs/gh-actions-k8s-runner/resource-report@main
+    if: always()
+  ```
+
+  Job hooks can't upload artifacts (the runner withholds `ACTIONS_RUNTIME_TOKEN` from
+  scripts), which is why this one step is needed. On runners without the sampler it logs a
+  notice and does nothing.
+
+Memory means **working set** (`memory.current − inactive_file`), what kubelet and the OOM
+killer act on. This kernel (5.15) has no `memory.peak`, so peaks exist only because sampling
+catches them.
 
 ## Read this before changing anything
 

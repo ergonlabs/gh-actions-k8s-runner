@@ -250,4 +250,17 @@ open(p, "wb").write(d.replace(old, new))
 print(f"patched {p}: {n} occurrence")
 PY
 
+# ---------------------------------------------------------------------------
+# Per-job resource report (added 2026-09-29).
+#
+# job-completed.sh runs as the runner's ACTIONS_RUNNER_HOOK_JOB_COMPLETED hook (env set in
+# the scale-set manifests, not here, so a pod spec without the metrics mount doesn't run it).
+# It renders the per-second cgroup samples that manifests/47-resource-sampler.yaml collects
+# for this pod — mounted read-only at /resource-metrics — into the job summary. stdlib-only
+# Python, using the python3 installed above. The resource-report composite action at the repo
+# root runs its own copy of render.py to upload the HTML as an artifact.
+COPY resource-report/ /opt/resource-report/
+RUN chmod 0755 /opt/resource-report/*.sh /opt/resource-report/*.py \
+    && python3 -m py_compile /opt/resource-report/render.py
+
 USER runner

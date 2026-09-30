@@ -44,6 +44,8 @@ kubectl get svc arc-hub-mirror -n arc-runners >/dev/null 2>&1 \
   && ok "hub mirror service present" || bad "hub mirror missing — Docker Hub 429s will return"
 kubectl get deploy arc-store-gc-pressure -n arc-runners -o jsonpath='{.status.readyReplicas}' 2>/dev/null | grep -q '^1$' \
   && ok "store-gc pressure watcher running" || bad "pressure watcher not ready — ENOSPC bursts won't get a fast reaction"
+kubectl get ds arc-resource-sampler -n arc-runners -o jsonpath='{.status.numberReady}' 2>/dev/null | grep -q '^1$' \
+  && ok "resource sampler running" || bad "resource sampler not ready — no per-job resource reports"
 
 # ---------------------------------------------------------------- host
 step "Host"
@@ -116,6 +118,8 @@ else
   chk "/dev/shm > 64M (Chromium stability)"              'df -h /dev/shm | tail -1 | awk "{print \$2}"' '[0-9]G'
   chk "_work on block device, NOT nfs"                   'df -h /home/runner/_work | tail -1 | awk "{print \$1}"' '^/dev/'
   chk "cache redirected to in-cluster server"            'printenv ACTIONS_RESULTS_URL' 'arc-cache'
+  chk "resource samples visible to runner (report hook)"  'test -s /resource-metrics/samples.jsonl && echo present' 'present'
+  chk "job-completed hook wired"                         'printenv ACTIONS_RUNNER_HOOK_JOB_COMPLETED' 'resource-report'
 
   # SA token must NOT be mounted, or kubectl silently uses the runner namespace
   if kubectl exec -n arc-runners "$POD" -c runner -- test -f /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null; then
