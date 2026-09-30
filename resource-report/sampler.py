@@ -319,7 +319,6 @@ def main():
     next_archive = 0.0
     tick = time.monotonic()
     while True:
-        now_wall = time.time()
         if time.monotonic() >= next_api:
             next_api = time.monotonic() + API_REFRESH_S
             try:
@@ -356,7 +355,11 @@ def main():
             cg = pod_cgroup_dir(info["uid"], info["qos"])
             if not os.path.isdir(cg) or name not in meta_sig:
                 continue
-            rec = {"t": round(now_wall, 3), "c": {}}
+            # Timestamp each pod at the moment its counters are read, NOT once per tick: the
+            # API refresh above can delay a tick's reads by ~1 s, and a stale tick timestamp
+            # then divides ~1.8 s of CPU usage by a 1 s interval (observed 2026-09-30: runner
+            # at 7 cores under a 4-core limit).
+            rec = {"t": round(time.time(), 3), "c": {}}
             try:
                 rec["pod"] = sample_cgroup(cg)
             except OSError:
