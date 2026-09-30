@@ -215,6 +215,23 @@ spec:
               # The hook always exits 0 — a failing job hook would fail the job.
               - name: ACTIONS_RUNNER_HOOK_JOB_COMPLETED
                 value: /opt/resource-report/job-completed.sh
+              # Job-time caches -> this pod's workspace on the iSCSI LUN instead of the
+              # container's writable layer on the host ROOT FS. ~0.6-1 GB per pod (mostly Go's
+              # build cache under ~/.cache) x up to 17 concurrent pods tipped / into kubelet
+              # DiskPressure twice on 2026-09-30, the 2nd time a 1h45m full ARC outage (see the
+              # arc-root-fs-diskpressure-eviction memory). Under _work/<pod> they are swept with the
+              # rest of the workspace by 30-store-gc.yaml. PLAYWRIGHT_BROWSERS_PATH (set in the
+              # image) keeps pointing at the browsers baked into ~/.cache, so those still resolve.
+              # sugarmaple-app workflows hard-code none of these paths (checked 2026-09-30); a
+              # workflow that caches a literal ~/.cache/... path would now cache an empty dir.
+              - name: XDG_CACHE_HOME            # go-build, corepack, most tools' caches
+                value: /home/runner/_work/_home/cache
+              - name: XDG_DATA_HOME             # pnpm's default store, other ~/.local/share users
+                value: /home/runner/_work/_home/share
+              - name: npm_config_cache          # ~/.npm (_cacache)
+                value: /home/runner/_work/_home/npm
+              - name: GOMODCACHE                # ~/go/pkg/mod
+                value: /home/runner/_work/_home/go-mod
             resources:
               requests:
                 cpu: 250m

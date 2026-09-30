@@ -120,6 +120,7 @@ else
   chk "cache redirected to in-cluster server"            'printenv ACTIONS_RESULTS_URL' 'arc-cache'
   chk "resource samples visible to runner (report hook)"  'test -s /resource-metrics/samples.jsonl && echo present' 'present'
   chk "job-completed hook wired"                         'printenv ACTIONS_RUNNER_HOOK_JOB_COMPLETED' 'resource-report'
+  chk "caches redirected to LUN (not root FS)"           'printenv XDG_CACHE_HOME' '_work/_home'
 
   # SA token must NOT be mounted, or kubectl silently uses the runner namespace
   if kubectl exec -n arc-runners "$POD" -c runner -- test -f /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null; then
