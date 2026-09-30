@@ -21,8 +21,16 @@
 #   uploads that report as a build artifact.
 #
 #   Sampling from outside the pod (rather than a sampler process inside the runner) is what
-#   makes the sidecars visible: everything inside dind — including the E2E job's nested kind
-#   cluster — is billed to the dind container's cgroup.
+#   makes the sidecars visible.
+#
+#   DIND ESCAPES THE POD'S CGROUPS (found 2026-09-30). dind is privileged, so its dockerd puts
+#   the containers it starts at the HOST's /sys/fs/cgroup/docker/<id>, NOT under dind's own
+#   cgroup. The E2E job's kind node (~6 GiB working set, ~13 GiB with page cache, the whole app
+#   stack) is therefore invisible in the pod's cgroups and bound by NO pod/container limit — dind's
+#   8Gi limit covers only dockerd itself. The sampler attributes each docker/<id> to its runner
+#   pod through the process tree and also samples every kind pod nested inside it, named from
+#   the pod's HOSTNAME env. That needs the host PID namespace and ptrace-level /proc reads
+#   (environ, root/), which is why this DaemonSet runs privileged with hostPID. It only reads.
 #
 # STORAGE / RETENTION
 #   ~0.5 KB per pod per second. Once a pod is gone (confirmed by an individual GET, same
@@ -83,12 +91,15 @@ spec:
         app: arc-resource-sampler
     spec:
       serviceAccountName: arc-resource-sampler
+      hostPID: true   # map dind-started containers to runner pods, name kind pods (see header)
       securityContext:
         runAsUser: 0   # writes root-owned dirs on the LUN, chmods them readable for uid 1001
       containers:
         - name: sampler
           image: python:3.13-alpine
           command: ["python3", "-u", "/scripts/sampler.py"]
+          securityContext:
+            privileged: true   # ptrace-level /proc reads across AppArmor profiles; read-only use
           env:
             - name: SAMPLE_INTERVAL_S
               value: "1"
@@ -101,7 +112,7 @@ spec:
               memory: 256Mi
           volumeMounts:
             - name: host-cgroup
-              mountPath: /host-cgroup
+              mountPath: /host-cgroup   # whole tree: kubepods.slice/ and docker/ (dind's containers)
               readOnly: true
             - name: data
               mountPath: /data
@@ -110,7 +121,7 @@ spec:
       volumes:
         - name: host-cgroup
           hostPath:
-            path: /sys/fs/cgroup/kubepods.slice
+            path: /sys/fs/cgroup
             type: Directory
         # DirectoryOrCreate (unlike the stores' `Directory`) is fine here: if the LUN were
         # unmounted, the runner pods' own `work` volume already fails them loudly, and this

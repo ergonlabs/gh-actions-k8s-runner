@@ -507,6 +507,38 @@ future ones) needs the two to move together. There's no automated check today �
 caught by a real job failure. If this recurs, consider a scheduled diff between the image's pin
 and `sugarmaple-app`'s lockfile rather than waiting for a failure.
 
+## 17. dind's containers (the E2E kind cluster) escape the runner pod's cgroups and limits
+
+**Symptom.** The first E2E resource report (2026-09-30) showed dind at ~200 MiB and the whole
+pod at ~1.2 GiB during a job that runs a full kind cluster with ~30 app pods. Meanwhile, host
+memory showed a 12–13 GiB cgroup for each running E2E job.
+
+**Cause.** dind runs `privileged`, which gives it the host cgroup namespace; its dockerd
+(cgroupfs driver) creates every container's cgroup at the **host's**
+`/sys/fs/cgroup/docker/<id>` — a sibling of `kubepods.slice`, not a child of dind's own scope.
+So the kind node (and anything else a job runs with `docker run`) is:
+
+- invisible in the runner pod's cgroups, `kubectl top`, and kubelet eviction accounting;
+- bound by **no** limit — dind's `8Gi` covers only dockerd itself (`memory.max` on the
+  `docker/<id>` cgroup is `max`).
+
+Measured: kind node working set ~6 GiB (~13 GiB with page cache) per E2E job; with the large
+pool at `maxRunners: 3` that is ~18 GiB of working set k8s neither sees nor limits.
+
+**Evidence.** `cat /proc/self/cgroup` inside dind shows the host path (no cgroupns);
+`ls /sys/fs/cgroup/docker/` on the host lists the kind nodes; walking a kind-node process's
+PPid chain lands in dind's `cri-containerd-<id>.scope` under the runner pod.
+
+**What we did.** Observability only, for now: `arc-resource-sampler` (47-resource-sampler.yaml)
+attributes each `docker/<id>` to its runner pod through the process tree and samples every kind
+pod inside it, so reports show the real job footprint and per-service memory. Stale, empty
+`docker/<id>` cgroups from dead dinds accumulate on the host; they hold no memory.
+
+**Not done (a design decision, not a bug fix):** bounding it. Options if it's ever needed:
+point dind's dockerd at a cgroup parent inside its own scope (`--cgroup-parent` plus cgroupns /
+delegation), or cap the kind node container itself (`docker update --memory`) from the job.
+Both change E2E behaviour and should be trialled.
+
 ## 13. Things that look like problems but aren't
 
 - **`docker system prune` frees nothing.** On a box like this Docker reports 0 B reclaimable

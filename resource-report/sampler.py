@@ -3,7 +3,17 @@
 
 Every INTERVAL seconds, reads the cgroup v2 counters of every container in every live runner
 pod straight from the host's cgroup tree, plus node-wide context from /proc, and appends one
-JSON line to /data/<pod-name>/samples.jsonl. The runner container mounts its own
+JSON line to /data/<pod-name>/samples.jsonl.
+
+NESTED CONTAINERS (key "x") and KIND PODS (key "k"): the dind sidecar is privileged, so its
+dockerd creates containers' cgroups at the HOST's top-level /sys/fs/cgroup/docker/<id> — NOT
+under dind's own cgroup. Everything dind runs (the E2E job's kind node: ~12 GiB, the whole
+app stack) is therefore invisible in the pod's cgroups and unconstrained by its limits. We
+attribute each docker/<id> to its runner pod via the process tree (a process in it -> its
+parent containerd-shim -> the shim's cgroup, which is dind's scope in the runner pod), then
+also sample every kind pod nested inside it (kubelet.slice/kubelet-kubepods.slice/...), named
+from the pod's HOSTNAME env (hostNetwork/static pods: the process name, e.g. etcd). That needs
+hostPID and ptrace-level /proc access, hence the DaemonSet runs privileged. The runner container mounts its own
 /data/<pod-name> read-only at /resource-metrics, and runner-image/resource-report/render.py
 turns it into the per-job HTML report.
 
@@ -27,7 +37,10 @@ API_REFRESH_S = 5
 NAMESPACE = os.environ.get("RUNNER_NAMESPACE", "arc-runners")
 SELECTOR = "actions-ephemeral-runner=True"
 POD_PREFIX = "ergonlabs-k8s-"
-CGROUP_ROOT = os.environ.get("CGROUP_ROOT", "/host-cgroup")  # host's /sys/fs/cgroup/kubepods.slice
+HOST_CGROUP = os.environ.get("HOST_CGROUP", "/host-cgroup")  # host's /sys/fs/cgroup (read-only)
+CGROUP_ROOT = os.path.join(HOST_CGROUP, "kubepods.slice")
+DOCKER_ROOT = os.path.join(HOST_CGROUP, "docker")  # where privileged dind's containers land
+PROC = os.environ.get("HOST_PROC", "/proc")  # hostPID: true, so this is the host's /proc
 DATA = os.environ.get("DATA_DIR", "/data")
 ARCHIVE = os.path.join(DATA, "_archive")
 ARCHIVE_DAYS = int(os.environ.get("ARCHIVE_DAYS", "30"))
@@ -214,6 +227,145 @@ def sample_node():
     }
 
 
+def sample_light(d):
+    """Reduced counter set for nested containers and kind pods (dozens per E2E pod)."""
+    cs = kv(os.path.join(d, "cpu.stat"))
+    ms = kv(os.path.join(d, "memory.stat"))
+    ev = kv(os.path.join(d, "memory.events"))
+    return {
+        "u": int(cs["usage_usec"]),
+        "m": int(read(os.path.join(d, "memory.current"))),
+        "a": int(ms.get("anon", 0)),
+        "f": int(ms.get("file", 0)),
+        "if": int(ms.get("inactive_file", 0)),
+        "o": int(ev.get("oom_kill", 0)),
+    }
+
+
+def cg_pids(d):
+    try:
+        return [int(x) for x in read(os.path.join(d, "cgroup.procs")).split()]
+    except (OSError, ValueError):
+        return []
+
+
+def subtree_pid(d):
+    """cgroup v2 keeps processes only in leaves, so look below d too."""
+    for root, dirs, _ in os.walk(d):
+        ps = cg_pids(root)
+        if ps:
+            return ps[0]
+    return None
+
+
+def proc_env(pid, key):
+    try:
+        with open(f"{PROC}/{pid}/environ", "rb") as f:
+            for kvp in f.read().split(b"\0"):
+                if kvp.startswith(key + b"="):
+                    return kvp.split(b"=", 1)[1].decode(errors="replace")
+    except OSError:
+        pass
+    return None
+
+
+def proc_comm(pid):
+    try:
+        return read(f"{PROC}/{pid}/comm").strip()
+    except OSError:
+        return None
+
+
+_POD_UID_RE = __import__("re").compile(r"pod([0-9a-f_]{36})\.slice/cri-containerd-")
+_KIND_POD_RE = __import__("re").compile(r"-pod[0-9a-f_]{36}\.slice$")
+
+
+def owner_pod_uid(pid, cid):
+    """uid (dashed) of the runner pod whose dind started docker container `cid`: walk up from
+    a process inside it until the parent is outside the container (dind's containerd-shim),
+    whose cgroup is dind's scope in the runner pod. A process in a kind pod has the kind
+    node's own shim as parent, so a single PPid hop is not enough."""
+    marker = f"/docker/{cid}"
+    for _ in range(64):
+        try:
+            ppid = int(read(f"{PROC}/{pid}/status").split("PPid:")[1].split()[0])
+            cg = read(f"{PROC}/{ppid}/cgroup")
+        except (OSError, IndexError, ValueError):
+            return None
+        if marker not in cg:
+            m = _POD_UID_RE.search(cg)
+            return m.group(1).replace("_", "-") if m else None
+        pid = ppid
+    return None
+
+
+def container_hostname(pid):
+    h = proc_env(pid, b"HOSTNAME")
+    if h:
+        return h
+    try:
+        return read(f"{PROC}/{pid}/root/etc/hostname").strip() or None
+    except OSError:
+        return None
+
+
+def discover_nested(uid_to_pod, known):
+    """-> {pod_name: {"x": {name: path}, "k": {name: path}}}. `known` caches docker-id -> owner
+    so ownership (stable for a container's life) is only resolved once."""
+    out = {}
+    if not os.path.isdir(DOCKER_ROOT):
+        return out
+    for cid in os.listdir(DOCKER_ROOT):
+        d = os.path.join(DOCKER_ROOT, cid)
+        if not os.path.isdir(d):
+            continue
+        pid = subtree_pid(d)
+        if pid is None:
+            known.pop(cid, None)
+            continue  # stale empty cgroup left by a dead dind
+        if cid not in known:
+            uid = owner_pod_uid(pid, cid)
+            name = container_hostname(pid) or cid[:12]
+            if name == cid[:12]:  # docker's default hostname; the process name says more
+                name = proc_comm(pid) or name
+            known[cid] = (uid, name)
+        uid, name = known[cid]
+        pod = uid_to_pod.get(uid)
+        if not pod:
+            continue
+        slot = out.setdefault(pod, {"x": {}, "k": {}})
+        key = name if name not in slot["x"] else f"{name}-{cid[:6]}"
+        slot["x"][key] = d
+        kp = os.path.join(d, "kubelet.slice", "kubelet-kubepods.slice")
+        if not os.path.isdir(kp):
+            continue
+        for root, dirs, _ in os.walk(kp):
+            for sub in dirs:
+                if not _KIND_POD_RE.search(sub):
+                    continue
+                pd = os.path.join(root, sub)
+                kname = None
+                for c in sorted(os.listdir(pd)):
+                    if not c.startswith("cri-containerd-"):
+                        continue
+                    for p in cg_pids(os.path.join(pd, c)):
+                        comm = proc_comm(p)
+                        if comm in (None, "pause"):
+                            continue
+                        h = proc_env(p, b"HOSTNAME")
+                        # hostNetwork pods (etcd, apiserver, kube-proxy, kindnet) inherit the
+                        # node's hostname; their process name identifies them instead.
+                        kname = h if h and h != name else comm
+                        break
+                    if kname:
+                        break
+                if not kname:
+                    continue  # only a pause container so far
+                k = kname if kname not in slot["k"] else f"{kname}-{sub[-12:-6]}"
+                slot["k"][k] = pd
+    return out
+
+
 # ---------------------------------------------------------------- per-pod output
 
 
@@ -313,8 +465,9 @@ def archive_dead(live):
 
 
 def main():
-    log(f"sampler starting: interval={INTERVAL}s cgroup_root={CGROUP_ROOT} data={DATA}")
+    log(f"sampler starting: interval={INTERVAL}s host_cgroup={HOST_CGROUP} data={DATA}")
     pods, writers, meta_sig = {}, {}, {}
+    nested, nested_known = {}, {}
     next_api = 0.0
     next_archive = 0.0
     tick = time.monotonic()
@@ -331,6 +484,10 @@ def main():
                 if name not in pods:
                     writers.pop(name).close()
                     meta_sig.pop(name, None)
+            try:
+                nested = discover_nested({i["uid"]: n for n, i in pods.items()}, nested_known)
+            except Exception as e:
+                log(f"nested discovery failed: {e}")
             for name, info in pods.items():
                 cg = pod_cgroup_dir(info["uid"], info["qos"])
                 sig = json.dumps(info["containers"], sort_keys=True)
@@ -369,6 +526,12 @@ def main():
                     rec["c"][cname] = sample_cgroup(os.path.join(cg, f"cri-containerd-{c['id']}.scope"))
                 except OSError:
                     pass
+            for key, kind in (("x", "x"), ("k", "k")):
+                for nname, path in nested.get(name, {}).get(kind, {}).items():
+                    try:
+                        rec.setdefault(key, {})[nname] = sample_light(path)
+                    except (OSError, KeyError, ValueError):
+                        pass  # torn down between discovery and read
             if node:
                 rec["node"] = node
             try:

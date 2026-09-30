@@ -28,7 +28,12 @@ runs:
         out="$RUNNER_TEMP/resource-report"
         # No --summary here: the runner's job-completed hook writes the job summary (with
         # complete data, after every step); this step only produces the files to upload.
-        if timeout 60 python3 "$GITHUB_ACTION_PATH/../runner-image/resource-report/render.py" --out "$out"; then
+        # Prefer the runner image's renderer: it always matches the sampler data format the
+        # cluster is producing, so renderer changes ship with the image instead of needing
+        # every workflow's pin bumped. Fall back to this action's copy elsewhere.
+        render=/opt/resource-report/render.py
+        [ -f "$render" ] || render="$GITHUB_ACTION_PATH/../runner-image/resource-report/render.py"
+        if timeout 120 python3 "$render" --out "$out"; then
           echo "ready=true" >> "$GITHUB_OUTPUT"
         else
           echo "::notice title=resource-report::No resource samples for this runner (not an arc-resource-sampler pod) — skipping."

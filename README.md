@@ -94,6 +94,10 @@ Every job on either pool gets a CPU/memory report, with no workflow changes:
   scripts), which is why this one step is needed. On runners without the sampler it logs a
   notice and does nothing.
 
+On E2E jobs the report also covers **containers dind started** (the kind node) and every
+**kind pod by workload**. They live outside the runner pod's cgroups and limits
+(docs/findings.md #17), so the sampler runs privileged with `hostPID` to attribute them.
+
 Memory means **working set** (`memory.current − inactive_file`), what kubelet and the OOM
 killer act on. This kernel (5.15) has no `memory.peak`, so peaks exist only because sampling
 catches them.

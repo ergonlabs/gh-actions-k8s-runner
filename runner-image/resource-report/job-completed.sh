@@ -12,7 +12,7 @@
 # Hooks can't upload artifacts: the runner only hands ACTIONS_RUNTIME_TOKEN to node actions,
 # never to scripts (ScriptHandler). The HTML goes up via the resource-report composite action.
 out="${RUNNER_TEMP:-/tmp}/resource-report-final"
-timeout 60 python3 /opt/resource-report/render.py \
+timeout 120 python3 /opt/resource-report/render.py \
   --out "$out" \
   --summary "${GITHUB_STEP_SUMMARY:-}" \
   || echo "resource-report: skipped (exit $?)"

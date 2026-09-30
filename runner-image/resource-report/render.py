@@ -89,6 +89,18 @@ def parse_worker_log(diag_dir):
 # ------------------------------------------------------------------ derivation
 
 
+def cg_get(r, k):
+    """Counters for key k in one sample: "pod", a k8s container name, "x:<name>" (a container
+    dind started, outside the pod's cgroup) or "k:<name>" (a pod inside the kind cluster)."""
+    if k == "pod":
+        return r.get("pod")
+    if k.startswith("x:"):
+        return r.get("x", {}).get(k[2:])
+    if k.startswith("k:"):
+        return r.get("k", {}).get(k[2:])
+    return r.get("c", {}).get(k)
+
+
 def derive(samples, containers):
     """Turn raw cumulative counters into per-interval series. Each series list is aligned
     with `t` (one entry per sample after the first); None where a value isn't available
@@ -98,8 +110,7 @@ def derive(samples, containers):
     s = {k: {f: [] for f in ("cpu", "thr", "ws", "anon", "file", "inact", "mpsi", "cpsi")} for k in keys}
     node = {f: [] for f in ("mem_used_pct", "cpu_busy_pct", "mpsi", "cpsi")}
 
-    def get(r, k):
-        return r.get("pod") if k == "pod" else r.get("c", {}).get(k)
+    get = cg_get
 
     for prev, cur in zip(samples, samples[1:]):
         dt = cur["t"] - prev["t"]
@@ -122,6 +133,10 @@ def derive(samples, containers):
                     d[f].append(None)
                 continue
             d["cpu"].append((b["u"] - a["u"]) / dt / 1e6)
+            if "p" not in b:  # nested/kind samples carry no throttling or PSI counters
+                for f in ("thr", "mpsi", "cpsi"):
+                    d[f].append(None)
+                continue
             dp = b["p"] - a["p"]
             d["thr"].append(100.0 * (b["th"] - a["th"]) / dp if dp > 0 else 0.0)
             d["mpsi"].append(min(100.0, (b["mps"] - a["mps"]) / dt / 1e4))
@@ -171,8 +186,8 @@ def rolling_mean(xs, n):
 def counter_delta(samples, k, field):
     first = last = None
     for r in samples:
-        c = r.get("pod") if k == "pod" else r.get("c", {}).get(k)
-        if c is None:
+        c = cg_get(r, k)
+        if c is None or field not in c:
             continue
         if first is None:
             first = c[field]
@@ -237,6 +252,33 @@ def of_limit(v, lim):
 
 # ------------------------------------------------------------------ report model
 
+# Kubernetes' random name suffixes use this vowel-free alphabet, so stripping only suffixes
+# drawn from it can't eat a real name part like "-plane".
+_K8S_RAND = "[bcdfghjklmnpqrstvwxz2456789]"
+_WORKLOAD_RES = [
+    re.compile(rf"^(.+)-{_K8S_RAND}{{6,10}}-{_K8S_RAND}{{5}}$"),  # Deployment pod
+    re.compile(rf"^(.+)-{_K8S_RAND}{{5}}$"),                      # DaemonSet / Job pod
+    re.compile(r"^(.+)-\d+$"),                                    # StatefulSet pod
+]
+
+
+def workload_of(pod_name):
+    for rx in _WORKLOAD_RES:
+        m = rx.match(pod_name)
+        if m:
+            return m.group(1)
+    return pod_name
+
+
+def sum_series(parts):
+    """Element-wise sum ignoring gaps; None only where every part is None."""
+    out = []
+    for xs in zip(*parts):
+        v = [x for x in xs if x is not None]
+        out.append(sum(v) if v else None)
+    return out
+
+
 
 def build(metrics_dir, diag_dir):
     meta_p = os.path.join(metrics_dir, "meta.json")
@@ -254,17 +296,31 @@ def build(metrics_dir, diag_dir):
     t_start = job_start or samples[0]["t"]
     t_end = samples[-1]["t"]
 
-    present = set()
+    present, xpresent, kpresent = set(), set(), set()
     for r in samples:
         present.update(r.get("c", {}).keys())
+        xpresent.update(r.get("x", {}).keys())
+        kpresent.update(r.get("k", {}).keys())
     containers = [c for c in KNOWN_ORDER if c in present] + sorted(present - set(KNOWN_ORDER))
-    t, s, node = derive(samples, containers)
+    xkeys = [f"x:{n}" for n in sorted(xpresent)]
+    kkeys = [f"k:{n}" for n in sorted(kpresent)]
+    t, s, node = derive(samples, containers + xkeys + kkeys)
     cmeta = meta.get("containers", {})
+    disp = {k: (f"dind › {k[2:]}" if k.startswith("x:") else k) for k in containers + xkeys}
+    disp["pod"] = "pod total (k8s)" if xkeys else "pod total"
+    disp["job"] = "job total"
+    chart_keys = containers + xkeys
+    names = [disp[k] for k in chart_keys]
+
+    # "job" = the pod's own cgroups + everything dind started outside them. Only differs from
+    # "pod" on large-pool jobs that run containers (e.g. the E2E kind cluster).
+    s["job"] = {f: sum_series([s[k][f] for k in ["pod"] + xkeys]) for f in ("ws", "anon", "inact", "cpu")}
+    tot_key = "job" if xkeys else "pod"
 
     # ---- per-container stats
     rows = []
-    for c in containers + ["pod"]:
-        m = cmeta.get(c, {}) if c != "pod" else {
+    for c in containers + xkeys + ["pod"] + (["job"] if xkeys else []):
+        m = {} if c.startswith("x:") or c == "job" else cmeta.get(c, {}) if c != "pod" else {
             "mem_limit": meta.get("pod_mem_limit"),
             "cpu_limit": meta.get("pod_cpu_limit"),
             "mem_request": sum((cmeta[x].get("mem_request") or 0) for x in containers if x in cmeta) or None,
@@ -273,9 +329,12 @@ def build(metrics_dir, diag_dir):
         d = s[c]
         pk = peak(d["ws"])
         pk_i = d["ws"].index(pk) if pk is not None else None
-        cpu_used = counter_delta(samples, c, "u") / 1e6
+        parts = ["pod"] + xkeys if c == "job" else [c]
+        cpu_used = sum(counter_delta(samples, x, "u") for x in parts) / 1e6
         rows.append({
-            "name": "pod total" if c == "pod" else c,
+            "name": disp[c],
+            "nested": c.startswith("x:"),
+            "total": c in ("pod", "job"),
             "mem_request": m.get("mem_request"),
             "mem_limit": m.get("mem_limit"),
             "ws_peak": pk,
@@ -284,9 +343,9 @@ def build(metrics_dir, diag_dir):
             "ws_p50": pct(d["ws"], 50),
             "anon_peak": peak(d["anon"]),
             "ws_peak_pct": of_limit(pk, m.get("mem_limit")),
-            "oom_kills": counter_delta(samples, c, "o"),
-            "mem_max_events": counter_delta(samples, c, "mx"),
-            "mem_psi_peak": peak(rolling_mean(d["mpsi"], 10)),
+            "oom_kills": sum(counter_delta(samples, x, "o") for x in parts),
+            "mem_max_events": sum(counter_delta(samples, x, "mx") for x in parts),
+            "mem_psi_peak": peak(rolling_mean(d.get("mpsi", []), 10)),
             "cpu_request": m.get("cpu_request"),
             "cpu_limit": m.get("cpu_limit"),
             "cpu_avg": cpu_used / max(1e-9, t_end - samples[0]["t"]),
@@ -294,8 +353,28 @@ def build(metrics_dir, diag_dir):
             "cpu_peak": peak(rolling_mean(d["cpu"], 5)),
             "cpu_seconds": cpu_used,
             "throttled_pct": throttle_total(samples, c) if m.get("cpu_limit") else None,
-            "cpu_psi_peak": peak(rolling_mean(d["cpsi"], 10)),
+            "cpu_psi_peak": peak(rolling_mean(d.get("cpsi", []), 10)),
         })
+
+    # ---- kind-cluster workloads (pods grouped by owning Deployment/StatefulSet/DaemonSet)
+    groups = {}
+    for k in kkeys:
+        groups.setdefault(workload_of(k[2:]), []).append(k)
+    window = max(1e-9, t_end - samples[0]["t"])
+    kind_rows, wl_series = [], {}
+    for wl, ks in groups.items():
+        ws = sum_series([s[k]["ws"] for k in ks])
+        cpu = sum_series([s[k]["cpu"] for k in ks])
+        wl_series[wl] = (ws, cpu)
+        used = sum(counter_delta(samples, k, "u") for k in ks) / 1e6
+        kind_rows.append({
+            "name": wl, "pods": len(ks),
+            "ws_peak": peak(ws), "ws_p95": pct(ws, 95), "ws_p50": pct(ws, 50),
+            "anon_peak": peak(sum_series([s[k]["anon"] for k in ks])),
+            "oom_kills": sum(counter_delta(samples, k, "o") for k in ks),
+            "cpu_avg": used / window, "cpu_peak": peak(rolling_mean(cpu, 5)), "cpu_seconds": used,
+        })
+    kind_rows.sort(key=lambda r: -(r["ws_peak"] or 0))
 
     # ---- per-step stats
     step_rows = []
@@ -308,16 +387,17 @@ def build(metrics_dir, diag_dir):
             continue
         sl = lambda xs: xs[a:b]  # noqa: E731
         top = None
-        for c in containers:
+        for c in chart_keys:
             p = peak(sl(s[c]["ws"]))
             if p is not None and (top is None or p > top[1]):
-                top = (c, p)
-        cpu5 = rolling_mean(s["pod"]["cpu"], 5)[a:b]
+                top = (disp[c], p)
+        tot = s[tot_key]
+        cpu5 = rolling_mean(tot["cpu"], 5)[a:b]
         step_rows.append({
             "i": i + 1, "name": n, "start": st - t_start, "dur": en - st,
-            "ws_peak": peak(sl(s["pod"]["ws"])),
-            "top": top[0] if top and len(containers) > 1 else None,
-            "cpu_avg": (sum(vals(sl(s["pod"]["cpu"]))) / max(1, len(vals(sl(s["pod"]["cpu"]))))) if vals(sl(s["pod"]["cpu"])) else None,
+            "ws_peak": peak(sl(tot["ws"])),
+            "top": top[0] if top and len(chart_keys) > 1 else None,
+            "cpu_avg": (sum(vals(sl(tot["cpu"]))) / max(1, len(vals(sl(tot["cpu"]))))) if vals(sl(tot["cpu"])) else None,
             "cpu_peak": peak(cpu5),
             "thr": peak(rolling_mean(sl(s["pod"]["thr"]), 5)) if meta.get("pod_cpu_limit") else None,
             "mpsi": peak(rolling_mean(sl(s["pod"]["mpsi"]), 5)),
@@ -332,15 +412,22 @@ def build(metrics_dir, diag_dir):
         series.append(xs)
         aggs.append(agg)
 
-    for c in containers:
+    for c in chart_keys:
         add(f"ws:{c}", s[c]["ws"], "max")
         add(f"cpu:{c}", s[c]["cpu"], "mean")
         add(f"thr:{c}", rolling_mean(s[c]["thr"], 5), "mean")
-    p = s["pod"]
-    add("pod:ws", p["ws"], "max")
-    add("pod:anon", p["anon"], "max")
-    add("pod:other", [None if w is None or a is None else max(0, w - a) for w, a in zip(p["ws"], p["anon"])], "max")
-    add("pod:inact", p["inact"], "max")
+    add("job:ws", s["job"]["ws"], "max")
+    add("job:cpu", s["job"]["cpu"], "mean")
+    p, jt = s["pod"], s[tot_key]
+    add("pod:anon", jt["anon"], "max")
+    add("pod:other", [None if w is None or a is None else max(0, w - a) for w, a in zip(jt["ws"], jt["anon"])], "max")
+    add("pod:inact", jt["inact"], "max")
+    top_wl = [r["name"] for r in kind_rows[:7]]
+    rest = [wl for wl in wl_series if wl not in top_wl]
+    for wl in top_wl:
+        add(f"wl:{wl}", wl_series[wl][0], "max")
+    if rest:
+        add("wl:__other", sum_series([wl_series[wl][0] for wl in rest]), "max")
     add("pod:mpsi", p["mpsi"], "mean")
     add("pod:cpsi", p["cpsi"], "mean")
     for f in node:
@@ -350,16 +437,19 @@ def build(metrics_dir, diag_dir):
     def S(key):
         return [None if v is None else round(v, 4) for v in ds[idx[key]]]
 
-    lim = {c: cmeta.get(c, {}) for c in containers}
+    lim = {c: cmeta.get(c, {}) for c in chart_keys}
+    job_line = [{"name": "job total", "ink": True, "values": S("job:ws")}] if xkeys else []
+    job_cpu_line = [{"name": "job total", "ink": True, "values": S("job:cpu")}] if xkeys else []
     charts = [
         {
             "id": "mem", "title": "Memory working set by container", "unit": "bytes",
-            "sub": "memory.current − inactive_file: what kubelet evicts on and the OOM killer counts. Bucketed by max, so spikes aren't averaged away.",
-            "series": [{"name": c, "slot": slot_for(c, containers), "values": S(f"ws:{c}")} for c in containers],
+            "sub": "memory.current − inactive_file: what kubelet evicts on and the OOM killer counts. Bucketed by max, so spikes aren't averaged away."
+                   + (" “dind ›” series are containers dind started (e.g. the kind node): outside the pod's cgroups, so no k8s limit applies to them." if xkeys else ""),
+            "series": [{"name": disp[c], "slot": slot_for(disp[c], names), "values": S(f"ws:{c}")} for c in chart_keys] + job_line,
             "refs": [{"label": f"{c} limit", "value": lim[c].get("mem_limit")} for c in containers if lim[c].get("mem_limit")],
         },
         {
-            "id": "memcomp", "title": "Pod memory: what the working set is made of", "unit": "bytes", "stacked": True,
+            "id": "memcomp", "title": ("Job" if xkeys else "Pod") + " memory: what the working set is made of", "unit": "bytes", "stacked": True,
             "sub": "Anonymous (heap/stack, can't be reclaimed) + active page cache & kernel, with reclaimable cache on top. Only the bottom two count toward OOM.",
             "series": [
                 {"name": "anonymous", "seq": 600, "values": S("pod:anon")},
@@ -370,14 +460,20 @@ def build(metrics_dir, diag_dir):
         {
             "id": "cpu", "title": "CPU by container", "unit": "cores",
             "sub": "Cores in use, averaged per sample interval.",
-            "series": [{"name": c, "slot": slot_for(c, containers), "values": S(f"cpu:{c}")} for c in containers],
+            "series": [{"name": disp[c], "slot": slot_for(disp[c], names), "values": S(f"cpu:{c}")} for c in chart_keys] + job_cpu_line,
             "refs": [{"label": f"{c} limit", "value": lim[c].get("cpu_limit")} for c in containers if lim[c].get("cpu_limit")],
         },
         {
             "id": "thr", "title": "CPU throttling by container", "unit": "pct",
             "sub": "Share of 100 ms CFS periods in which the container hit its CPU limit and was paused (5 s rolling average).",
-            "series": [{"name": c, "slot": slot_for(c, containers), "values": S(f"thr:{c}")} for c in containers if lim[c].get("cpu_limit")],
+            "series": [{"name": disp[c], "slot": slot_for(disp[c], names), "values": S(f"thr:{c}")} for c in containers if lim[c].get("cpu_limit")],
         },
+        {
+            "id": "kind", "title": "Inside the kind cluster: memory by workload", "unit": "bytes", "stacked": True,
+            "sub": "Working set of the E2E cluster's pods, grouped by Deployment/StatefulSet/DaemonSet (replicas summed). Top 7 by peak; the rest are grouped as “other”.",
+            "series": ([{"name": wl, "slot": i + 1, "values": S(f"wl:{wl}")} for i, wl in enumerate(top_wl)]
+                       + ([{"name": f"other ({len(rest)})", "gray": True, "values": S("wl:__other")}] if rest else [])),
+        } if kind_rows else None,
         {
             "id": "psi", "title": "Stall time — this pod", "unit": "pct",
             "sub": "Pressure stall information: share of time at least one task in the pod was waiting on memory reclaim or for a CPU.",
@@ -403,7 +499,7 @@ def build(metrics_dir, diag_dir):
             ],
         },
     ]
-    charts = [c for c in charts if c["series"]]
+    charts = [c for c in charts if c and c["series"]]
 
     env = os.environ
     return {
@@ -417,8 +513,9 @@ def build(metrics_dir, diag_dir):
         "t_start": t_start,
         "t_end": t_end,
         "n_samples": len(samples),
-        "containers": containers,
+        "containers": names,
         "rows": rows,
+        "kind": kind_rows,
         "steps": step_rows,
         "chart_data": {
             "t": [round(x, 1) for x in dt],
@@ -426,7 +523,7 @@ def build(metrics_dir, diag_dir):
             "steps": [{"name": r["name"], "start": r["start"], "end": r["start"] + r["dur"]} for r in step_rows],
             "charts": charts,
         },
-        "raw": (t, s, node, containers),
+        "raw": (t, s, node, chart_keys + ["pod"] + (["job"] if xkeys else []), disp, wl_series),
     }
 
 
@@ -442,11 +539,16 @@ def slot_for(c, containers):
 
 
 def write_csv(rep, path):
-    t, s, node, containers = rep["raw"]
+    t, s, node, keys, disp, wl_series = rep["raw"]
     cols = []
-    for c in containers + ["pod"]:
+    for c in keys:
+        name = re.sub(r"\W+", "_", disp[c].replace("dind › ", "dind_")).strip("_")
         for f in ("ws", "anon", "file", "inact", "cpu", "thr", "mpsi", "cpsi"):
-            cols.append((f"{c}_{f}", s[c][f]))
+            if f in s[c]:
+                cols.append((f"{name}_{f}", s[c][f]))
+    for wl, (ws, cpu) in sorted(wl_series.items()):
+        name = re.sub(r"\W+", "_", wl)
+        cols += [(f"kind_{name}_ws", ws), (f"kind_{name}_cpu", cpu)]
     for f, xs in node.items():
         cols.append((f"node_{f}", xs))
     with open(path, "w", newline="") as fh:
@@ -473,9 +575,15 @@ def summary_md(rep, artifact_hint=True):
             f"| {fmt_pct(r['ws_peak_pct'])} | {r['oom_kills']} | {fmt_cores(r['cpu_avg'])} | {fmt_cores(r['cpu_peak'])} "
             f"| {fmt_cores(r['cpu_limit'])} | {fmt_pct(r['throttled_pct'])} |"
         )
+    if rep["kind"]:
+        L += ["", f"**Inside the kind cluster** — top workloads by peak working set ({len(rep['kind'])} total)", "",
+              "| workload | pods | mem peak | p95 | CPU avg | CPU peak (5s) | OOM kills |", "|---|--:|--:|--:|--:|--:|--:|"]
+        for k in rep["kind"][:10]:
+            L.append(f"| {k['name']} | {k['pods']} | {fmt_bytes(k['ws_peak'])} | {fmt_bytes(k['ws_p95'])} | "
+                     f"{fmt_cores(k['cpu_avg'])} | {fmt_cores(k['cpu_peak'])} | {k['oom_kills']} |")
     top = sorted((x for x in rep["steps"] if x.get("ws_peak")), key=lambda x: -x["ws_peak"])[:5]
     if top:
-        L += ["", "**Heaviest steps by pod memory**", "", "| step | duration | mem peak | CPU avg | CPU peak (5s) |", "|---|--:|--:|--:|--:|"]
+        L += ["", "**Heaviest steps by memory**", "", "| step | duration | mem peak | CPU avg | CPU peak (5s) |", "|---|--:|--:|--:|--:|"]
         for x in top:
             L.append(f"| {x['i']}. {x['name']} | {fmt_dur(x['dur'])} | {fmt_bytes(x['ws_peak'])} | {fmt_cores(x['cpu_avg'])} | {fmt_cores(x['cpu_peak'])} |")
     if artifact_hint:
@@ -492,6 +600,8 @@ def stdout_table(rep):
             f"  {r['name']:<22}{fmt_bytes(r['ws_peak']):>11}{fmt_bytes(r['mem_limit']):>11}{fmt_pct(r['ws_peak_pct']):>7}"
             f"{r['oom_kills']:>5}{fmt_cores(r['cpu_avg']):>9}{fmt_cores(r['cpu_peak']):>8}{fmt_pct(r['throttled_pct']):>6}"
         )
+    for k in rep["kind"][:10]:
+        out.append(f"    kind {k['name']:<22}{fmt_bytes(k['ws_peak']):>11}  cpu avg {fmt_cores(k['cpu_avg'])}")
     return "\n".join(out)
 
 
@@ -505,25 +615,32 @@ def tile(label, value, note="", status=None):
 
 def render_html(rep):
     m = rep["meta"]
-    pod = next(r for r in rep["rows"] if r["name"] == "pod total")
-    worst = max((r for r in rep["rows"] if r["name"] != "pod total" and r["ws_peak_pct"] is not None),
+    totals = [r for r in rep["rows"] if r["total"]]
+    pod, job = totals[0], totals[-1]  # job == pod when nothing ran outside the pod's cgroups
+    nested = [r for r in rep["rows"] if r["nested"]]
+    worst = max((r for r in rep["rows"] if not r["total"] and r["ws_peak_pct"] is not None),
                 key=lambda r: r["ws_peak_pct"], default=None)
-    ooms = sum(r["oom_kills"] for r in rep["rows"] if r["name"] != "pod total")
+    ooms = sum(r["oom_kills"] for r in rep["rows"] if not r["total"])
     e = html.escape
 
     def mem_status(p):
         return "critical" if p is not None and p >= 90 else "warning" if p is not None and p >= 75 else None
 
     tiles = [
-        tile("Peak pod memory", fmt_bytes(pod["ws_peak"]),
-             f"{fmt_pct(pod['ws_peak_pct'])} of {fmt_bytes(pod['mem_limit'])} pod limit" if pod["mem_limit"] else "no pod limit"),
+        tile("Peak job memory", fmt_bytes(job["ws_peak"]),
+             f"k8s pod {fmt_bytes(pod['ws_peak'])} + dind-spawned {fmt_bytes(sum(r['ws_peak'] or 0 for r in nested))} (peaks)" if nested
+             else f"{fmt_pct(pod['ws_peak_pct'])} of {fmt_bytes(pod['mem_limit'])} pod limit" if pod["mem_limit"] else "no pod limit"),
+    ] + ([
+        tile("Outside k8s limits", fmt_bytes(max((r["ws_peak"] or 0) for r in nested)),
+             "largest dind-spawned container — no memory limit applies", "warning"),
+    ] if nested else []) + [
         tile("Closest to its limit", f"{worst['name']} · {fmt_pct(worst['ws_peak_pct'])}" if worst else "–",
              f"{fmt_bytes(worst['ws_peak'])} of {fmt_bytes(worst['mem_limit'])}" if worst else "",
              mem_status(worst["ws_peak_pct"]) if worst else None),
         tile("OOM kills", str(ooms), "none in this job" if not ooms else "a process was killed for memory",
              "critical" if ooms else None),
-        tile("Avg CPU", f"{fmt_cores(pod['cpu_avg'])} cores",
-             f"peak {fmt_cores(pod['cpu_peak'])} (5 s avg) of {fmt_cores(pod['cpu_limit'])}" if pod["cpu_limit"] else f"peak {fmt_cores(pod['cpu_peak'])}"),
+        tile("Avg CPU", f"{fmt_cores(job['cpu_avg'])} cores",
+             f"peak {fmt_cores(job['cpu_peak'])} (5 s avg) of {fmt_cores(job['cpu_limit'])}" if job["cpu_limit"] else f"peak {fmt_cores(job['cpu_peak'])}"),
         tile("CPU throttled", fmt_pct(pod["throttled_pct"]), "of CFS periods, pod-wide",
              "warning" if (pod["throttled_pct"] or 0) >= 10 else None),
         tile("Duration", fmt_dur(rep["t_end"] - rep["t_start"]), f"{rep['n_samples']} samples @ {m.get('interval_s', 1)} s"),
@@ -533,8 +650,8 @@ def render_html(rep):
             "OOM kills", "hit limit", "CPU request", "CPU limit", "CPU avg", "CPU p95", "CPU peak", "CPU-seconds", "throttled"]
     trs = []
     for r in rep["rows"]:
-        cls = ' class="total"' if r["name"] == "pod total" else ""
-        sw = "" if r["name"] == "pod total" else f'<span class="sw" style="background:var(--s{slot_for(r["name"], rep["containers"])})"></span>'
+        cls = ' class="total"' if r["total"] else ""
+        sw = "" if r["total"] else f'<span class="sw" style="background:var(--s{slot_for(r["name"], rep["containers"])})"></span>'
         trs.append(
             f"<tr{cls}><th scope=row>{sw}{e(r['name'])}</th><td>{fmt_bytes(r['mem_request'])}</td><td>{fmt_bytes(r['mem_limit'])}</td>"
             f"<td><b>{fmt_bytes(r['ws_peak'])}</b></td><td>{fmt_bytes(r['ws_p95'])}</td><td>{fmt_bytes(r['ws_p50'])}</td>"
@@ -545,6 +662,20 @@ def render_html(rep):
     ctable = ("<table><thead><tr>" + "".join(f"<th scope=col>{h}</th>" for h in head) + "</tr></thead><tbody>"
               + "".join(trs) + "</tbody></table>")
 
+    krows = []
+    for k in rep["kind"]:
+        krows.append(
+            f"<tr><th scope=row>{e(k['name'])}</th><td>{k['pods']}</td><td><b>{fmt_bytes(k['ws_peak'])}</b></td>"
+            f"<td>{fmt_bytes(k['ws_p95'])}</td><td>{fmt_bytes(k['ws_p50'])}</td><td>{fmt_bytes(k['anon_peak'])}</td>"
+            f"<td>{k['oom_kills']}</td><td>{fmt_cores(k['cpu_avg'])}</td><td>{fmt_cores(k['cpu_peak'])}</td><td>{k['cpu_seconds']:.0f}</td></tr>"
+        )
+    ktable = ("<h2>Inside the kind cluster</h2><div class=\"muted\" style=\"font-size:12px;margin-bottom:8px\">Every pod the E2E "
+              "kind cluster ran, grouped by workload (replicas summed at each second). Sampled from the kind node's nested cgroups; "
+              "no Kubernetes limit on the runner pod applies to any of these.</div><div class=\"scroll\"><table><thead><tr>"
+              + "".join(f"<th scope=col>{h}</th>" for h in ["workload", "pods", "mem peak", "p95", "median", "anon peak", "OOM kills",
+                                                           "CPU avg", "CPU peak (5 s)", "CPU-seconds"])
+              + "</tr></thead><tbody>" + "".join(krows) + "</tbody></table></div>") if krows else ""
+
     srows = []
     for x in rep["steps"]:
         srows.append(
@@ -553,7 +684,7 @@ def render_html(rep):
             f"<td>{fmt_cores(x.get('cpu_peak'))}</td><td>{fmt_pct(x.get('thr'))}</td><td>{fmt_pct(x.get('mpsi'))}</td></tr>"
         )
     stable = ("<table><thead><tr><th scope=col>#</th><th scope=col>step</th><th scope=col>starts at</th><th scope=col>duration</th>"
-              "<th scope=col>pod mem peak</th><th scope=col>largest container</th><th scope=col>CPU avg</th><th scope=col>CPU peak (5 s)</th>"
+              "<th scope=col>mem peak</th><th scope=col>largest container</th><th scope=col>CPU avg</th><th scope=col>CPU peak (5 s)</th>"
               "<th scope=col>throttled peak</th><th scope=col>mem stall peak</th></tr></thead><tbody>" + "".join(srows) + "</tbody></table>"
               ) if srows else "<p class=muted>No step markers found (runner _diag log not available).</p>"
 
@@ -577,6 +708,7 @@ def render_html(rep):
             .replace("{{WHEN}}", e(when))
             .replace("{{TILES}}", "".join(tiles))
             .replace("{{CTABLE}}", ctable)
+            .replace("{{KTABLE}}", ktable)
             .replace("{{STABLE}}", stable)
             .replace("{{DATA}}", data))
 
@@ -638,6 +770,7 @@ footer{margin-top:36px;font-size:12px;color:var(--muted)}
 <div id="charts"></div>
 <h2>Per container</h2>
 <div class="scroll">{{CTABLE}}</div>
+{{KTABLE}}
 <h2>Per step</h2>
 <div class="scroll">{{STABLE}}</div>
 <footer>Sampled once per second per container from the host's cgroup v2 counters by arc-resource-sampler (ergonlabs/gh-actions-k8s-runner).
@@ -649,7 +782,7 @@ CPU peaks use a 5 s rolling average. Raw series: resource-samples.csv.</footer>
 (function(){
 const D=JSON.parse(document.getElementById('data').textContent);
 const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
-const colorOf=s=>s.slot?`var(--s${s.slot})`:s.seq?`var(--q${s.seq})`:`var(--${s.ctx})`;
+const colorOf=s=>s.slot?`var(--s${s.slot})`:s.seq?`var(--q${s.seq})`:s.ink?'var(--ink2)':s.gray?'var(--muted)':`var(--${s.ctx})`;
 const GiB=2**30,MiB=2**20;
 const fmt={bytes:v=>v==null?'–':v>=GiB?(v/GiB).toFixed(v>=10*GiB?1:2)+' GiB':(v/MiB).toFixed(0)+' MiB',
  cores:v=>v==null?'–':v.toFixed(2),pct:v=>v==null?'–':(v>=10?v.toFixed(0):v.toFixed(1))+'%'};
